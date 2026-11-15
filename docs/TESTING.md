@@ -74,3 +74,63 @@ audit files (monthly names, 0600, drop-on-overflow). No network.
 go test -race ./internal/gateway/... ./internal/keys/... ./internal/audit/...
 go test ./internal/gateway/ -run TestManifestGolden -update   # rewrite the golden after an intended change
 ```
+
+### Relay docker smoke test (`relay/test/run.sh`)
+
+Covers the server side of PLAN §5.5 with real software: `install/server.sh` (files, token, connect code, rerun keeps the
+token, `--rotate-token`, behind-proxy files), then the standalone compose stack (Caddy `tls internal` for the fake domain
+`homie.test` + frps) and a real `frpc` v0.72.0 over `wss` on 443. It asserts, all through Caddy on one domain and one
+frps port: GET and POST reach the echo backend; the channel survives 3 forced Caddy reloads (also with
+`grace_period 3s`), while the same reload without `stream_close_delay` drops it (control); with frpc stopped the bilingual
+offline page comes back with 404; frpc reconnects by itself; a wrong token and an untrusted CA are rejected. Everything is
+named `gpthome-test-*` and removed on exit (about 80 s).
+
+```sh
+bash relay/test/run.sh
+shellcheck -x install/server.sh relay/test/run.sh
+```
+
+Prerequisites: Docker with compose v2 and the images `ghcr.io/fatedier/frps:v0.72.0`, `ghcr.io/fatedier/frpc:v0.72.0`,
+`caddy:2.11.4-alpine`, `alpine:3.21`, `curlimages/curl:8.11.1` (pulled on first run), Go (builds `relay/test/echo`),
+openssl. No root, no network except image pulls, nothing on the host ports.
+
+### Relay client and homed spike (`internal/relay`, `internal/spike`, `cmd/homed`)
+
+Unit tests (no network, no Docker): connect code round trip and every parse error (tokens never in errors); the frp
+client settings of PLAN §5.5 (wss on 443, TLS name = domain, system roots or only the CA file, `loginFailExit = false`,
+one `http` proxy `homed` → `127.0.0.1:<port>`); the guard that refuses frp's default of not verifying the server
+certificate; the frp log bridge; the real embedded client retrying against a closed port and stopping cleanly;
+`SelfCheck` against an `httptest` TLS server (our id, another hub, not a hub, home offline, untrusted certificate); the
+spike REST façade, auth and `X-GPT-Home-Instance` on every response; `/mcp` through a go-sdk client with a relayed
+(non-loopback) Host; `homed relay connect` (homed.yaml kept, token 0600, stdin `-`) and the CLI checks.
+
+```sh
+go test -race ./internal/relay/... ./internal/spike/... ./cmd/homed/...
+```
+
+Integration test (Docker): the embedded client against the real `ghcr.io/fatedier/frps:v0.72.0` with the §5.5 config,
+behind an in-process TLS terminator for `homie.test` with a throwaway CA. It asserts the offline 404 page before
+connecting and after stopping, requests reaching the local hub, `SelfCheck`, an automatic reconnect after the channel is
+cut (with `Status.Since` moving), and that an untrusted certificate and a wrong token never connect and show up in
+`Status.LastError`. The frps container is named `gpthome-t03-frps-*` and removed at the end (about 3 s).
+
+```sh
+go test -race -tags integration -run Integration ./internal/relay/
+```
+
+The manual check of `homed run --spike` behind real Caddy is in `docs/research/frp-embedding.md` ("Local acceptance run").
+
+### pluginkit and the plugin host (`pluginkit/`, `internal/plugins/`)
+
+`pluginkit` is tested in memory against a go-sdk client: identity, instructions, tool `_meta`, the caller's request
+`_meta`, the tool name rule, `DataDir` and `Serve` shutdown. The host tests build two real plugins in `TestMain`
+(`internal/plugins/testdata/fakeplugin` and `pluginkit/example`) and run them as subprocesses: listing and audiences,
+`_meta` parsing (timeouts, inventory, bad values), invalid names skipped, calls with caller `_meta`, `isError`, the call
+timeout, a crash with last-known tools and `ErrPluginDown`, restart with backoff, the failing state, a missing binary,
+`list_changed` → `Changed()` (on the 2026-07-28 protocol and on the legacy 2025-11-25 handshake), the stderr log (ring
+and rotated file), the minimal env and data dir, and shutdown (SIGTERM, and SIGKILL for a plugin that ignores it).
+About 5 s; no network.
+
+```sh
+go test -race ./pluginkit/... ./internal/plugins/...
+```

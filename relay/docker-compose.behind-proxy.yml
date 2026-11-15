@@ -1,0 +1,22 @@
+# GPT-Home relay behind an existing reverse proxy: only frps, joined to the
+# proxy's docker network as `gpt-home-frps`. No ports are published.
+# The network name comes from .env (GPT_HOME_PROXY_NETWORK, default "proxy").
+name: gpt-home-relay
+
+services:
+  frps:
+    image: ghcr.io/fatedier/frps:v0.72.0
+    container_name: gpt-home-frps
+    restart: unless-stopped
+    command: ["-c", "/etc/frp/frps.toml"]
+    volumes:
+      - ./frps.toml:/etc/frp/frps.toml:ro
+      - ./token:/etc/frp/token:ro
+      - ./offline.html:/etc/frp/offline.html:ro
+    networks:
+      - proxy
+
+networks:
+  proxy:
+    name: ${GPT_HOME_PROXY_NETWORK:-proxy}
+    external: true
