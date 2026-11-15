@@ -67,3 +67,53 @@ jobs:
           node-version: 22
       - if: steps.detect.outputs.present == 'true'
         run: node --test "site/core/*.test.mjs"
+
+  # The plugin template is a module of its own (templates/plugin/go.mod), outside ./... of the jobs above.
+  template:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: templates/plugin/go.mod
+          cache-dependency-path: templates/plugin/go.sum
+      - uses: golangci/golangci-lint-action@v8
+        with:
+          version: v2.12.2
+          working-directory: templates/plugin
+      - run: go test -race ./...
+        working-directory: templates/plugin
+
+  # install/home.sh in Debian containers on both CPUs, also with systemd as PID 1 (docs/TESTING.md, "Home installers").
+  installers-linux:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - if: matrix.runner == 'ubuntu-latest'
+        run: install/test/run.sh lint
+      - run: install/test/run.sh linux
+        env:
+          PLATFORMS: native
+          SYSTEMD_PLATFORMS: native
+
+  # install/home.sh on macOS: files in a temp HOME, then real launchd under a test label.
+  installers-mac:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: install/test/run.sh mac
+
+  # install/server.sh and the relay stack: Caddy + frps + a real frpc over wss (docs/TESTING.md, "Relay docker smoke test").
+  relay:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+      - run: shellcheck -x install/server.sh relay/test/run.sh
+      - run: relay/test/run.sh
