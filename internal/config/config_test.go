@@ -61,13 +61,70 @@ func TestLoad(t *testing.T) {
 		t.Fatalf("plugin tv = %+v", p)
 	}
 	r := c.Person("roman")
-	if r == nil || len(r.Keys) != 1 || r.Keys[0].Label != "ChatGPT Site" ||
-		!r.Keys[0].Created.Equal(time.Date(2026, 11, 15, 12, 0, 0, 0, time.UTC)) {
+	if r == nil || len(r.Keys) != 1 || r.Keys[0].Label != "ChatGPT Site" || r.Keys[0].SHA256 != hashA ||
+		!r.Keys[0].Created.Equal(time.Date(2026, 11, 15, 12, 0, 0, 0, time.UTC)) || r.Plugins[0] != "*" {
 		t.Fatalf("person = %+v", r)
 	}
-	entries := c.KeyEntries()
-	if len(entries) != 1 || entries[0].SHA256 != hashA || entries[0].Person.Name != "Roman" || entries[0].Person.Plugins[0] != "*" {
-		t.Fatalf("entries = %+v", entries)
+	if !c.HasPhase1() {
+		t.Fatal("HasPhase1 = false for a phase 1 file")
+	}
+	if c, err := Load(writeSample(t, "listen: 127.0.0.1:8080\nsetup_listen: 192.168.68.63:8090\nrelay:\n  domain: homie.test\n")); err != nil ||
+		c.HasPhase1() || c.SetupListen != "192.168.68.63:8090" {
+		t.Fatalf("phase 2 file: %+v, %v", c, err)
+	}
+}
+
+// After the import, the phase 1 sections leave homed.yaml for homed.yaml.phase1; listen, relay and comments stay,
+// and a second archive never overwrites the first backup.
+func TestArchivePhase1(t *testing.T) {
+	dir := writeSample(t, sample)
+	backup, err := ArchivePhase1(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if backup != filepath.Join(dir, Phase1Backup) {
+		t.Fatalf("backup = %q", backup)
+	}
+	if got := readFile(t, backup); got != sample {
+		t.Fatalf("backup content:\n%s", got)
+	}
+	if st, err := os.Stat(backup); err != nil || st.Mode().Perm() != 0o600 {
+		t.Fatalf("backup mode: %v, %v", st, err)
+	}
+	out := readFile(t, filepath.Join(dir, FileName))
+	for _, gone := range []string{"home_name", "plugins:", "people:", hashA, "gpt-tv"} {
+		if strings.Contains(out, gone) {
+			t.Errorf("homed.yaml still has %q:\n%s", gone, out)
+		}
+	}
+	// "# my home" sits right above home_name, so YAML gives it to that key and it leaves with it (the backup has it).
+	for _, keep := range []string{"listen: 127.0.0.1:8080 # loopback only", "domain: homie.test"} {
+		if !strings.Contains(out, keep) {
+			t.Errorf("homed.yaml lost %q:\n%s", keep, out)
+		}
+	}
+	c, err := Load(dir)
+	if err != nil || c.HasPhase1() || c.Relay.Domain != "homie.test" {
+		t.Fatalf("after archive: %+v, %v", c, err)
+	}
+
+	// Nothing left to move: no new backup.
+	if again, err := ArchivePhase1(dir); err != nil || again != "" {
+		t.Fatalf("second archive = %q, %v", again, err)
+	}
+	// A hand edit that brings a section back is archived next to the first backup.
+	if err := os.WriteFile(filepath.Join(dir, FileName), []byte(out+"home_name: Дача\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	third, err := ArchivePhase1(dir)
+	if err != nil || third == "" || third == backup || !strings.HasPrefix(third, backup+".") {
+		t.Fatalf("archive after a hand edit = %q, %v", third, err)
+	}
+	if readFile(t, backup) != sample || !strings.Contains(readFile(t, third), "Дача") {
+		t.Fatal("the first backup was overwritten")
+	}
+	if missing, err := ArchivePhase1(t.TempDir()); err != nil || missing != "" {
+		t.Fatalf("no homed.yaml: %q, %v", missing, err)
 	}
 }
 
@@ -87,6 +144,8 @@ func TestValidate(t *testing.T) {
 	}{
 		{"unknown key", "home_nam: x\n", "field home_nam not found"},
 		{"public listen", "listen: 0.0.0.0:8080\n", "loopback only"},
+		{"setup_listen without port", "setup_listen: 0.0.0.0\n", "missing port"},
+		{"setup_listen bad port", "setup_listen: 0.0.0.0:http\n", "bad port"},
 		{"bad domain", "relay:\n  domain: https://x.test\n", "invalid relay domain"},
 		{"bad plugin id", "plugins:\n  - id: TV\n    command: [x]\n", "must match"},
 		{"duplicate plugin", "plugins:\n  - id: tv\n    command: [x]\n  - id: tv\n    command: [y]\n", "twice"},

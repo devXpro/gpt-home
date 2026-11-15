@@ -1,4 +1,6 @@
 /bin/
+# `go build ./cmd/homed` from the module root writes the binary here; `make build` puts it in bin/.
+/homed
 /dist/
 node_modules/
 /internal/web/dist/*

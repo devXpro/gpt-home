@@ -11,7 +11,7 @@ ChatGPT / a Site ──https──▶ relay server (Caddy: TLS ends here) ──
 
 | Secret | Where it lives | Who holds it | What it unlocks |
 |---|---|---|---|
-| Person key (`ghk_…`) | Only its SHA-256 in `homed.yaml`; the key itself in the person's ChatGPT Site settings (or the macOS Keychain) | The person's Site | The assistant tools of the plugins that person may use, through the REST façade and `/mcp`. |
+| Person key (`ghk_…`) | Only its SHA-256 in `homed.db` (phase 1: `homed.yaml`); the key itself in the person's ChatGPT Site settings (or the macOS Keychain) | The person's Site | The assistant tools of the plugins that person may use, through the REST façade and `/mcp`. |
 | Relay token | `relay-token` (0600) in the home data dir; `token` (0600) on the server; inside the connect code | The home box and the server | Registering the domain on frps, i.e. **being** the home as seen from the internet. |
 | Passkeys (phase 2) | The admin's devices; public keys at home | The admin | Admin actions, with a fresh assertion (step-up) for dangerous ones. |
 | TV client key | `tvs.json` in the gpt-tv plugin data dir | gpt-tv | Controlling that TV over the LAN. |
@@ -59,8 +59,9 @@ home.
   so the audit keeps only "invalid arguments" for them; the caller still gets the full message.
 - **A bad plugin tool cannot take the API down.** A tool whose schema the MCP server refuses is skipped with a warning
   when the plugin lists it and again when the gateway builds its tool set; the plugin's other tools keep working.
-- **Local admin socket.** `<data_dir>/homed.sock`, 0600. Whoever can open it is the hub's owner: it serves every tool,
-  admin ones included, without a key.
+- **Local admin socket.** `<data_dir>/homed.sock`, 0600, and homed accepts only connections from its own OS user
+  (peer credentials). Whoever can open it is the hub's owner: it serves the whole admin API (every tool, admin ones
+  included) without a key, a cookie or step-up, and it makes setup links (`homed admin setup-link`).
 - **Data dir.** Created 0700. Secret files in it are 0600, and `relay-token` is refused when group or others can read
   it. homed never changes the mode of an existing directory it did not create (a mistaken `--data-dir ~` must not lock
   up a home directory); it only tightens its platform default dir and warns about any other dir open to others.
@@ -73,9 +74,10 @@ Plugins are separate executables that the hub starts with a minimal environment 
 does and does not isolate:
 
 - **A plugin runs as the same OS user as homed. It is fully trusted.** It can read everything that user can:
-  `homed.yaml`, **`relay-token`**, the audit log, other plugins' data dirs, the user's files and, on a Mac, Keychain
-  items that user can open without a prompt. Install only plugins whose authors you trust as much as the hub itself.
-  Their per-plugin data dir (`GPT_HOME_DATA_DIR`, 0700) is for tidiness, not a sandbox.
+  `homed.db` (key hashes, sessions, the audit log), **`relay-token`**, the admin socket, other plugins' data dirs, the
+  user's files and, on a Mac, Keychain items that user can open without a prompt. Install only plugins whose authors
+  you trust as much as the hub itself. Their per-plugin data dir (`GPT_HOME_DATA_DIR`, 0700) is for tidiness, not a
+  sandbox.
 - Plugins never receive the callers' keys, and they are not reachable from the network through the hub: the hub talks
   to them over stdio only. They may make their own network connections (gpt-tv talks to TVs on the LAN).
 - The request `_meta` `gpt-home/caller` and `gpt-home/via` are informational; plugins must not base security

@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -9,33 +10,65 @@ import (
 	"net/url"
 	"strings"
 	"text/tabwriter"
+	"time"
 
 	"github.com/devXpro/gpt-home/internal/config"
 )
 
+// toolJSON is Tool and callJSON is Call (ADMIN-API §2), as far as the CLI shows them.
+type toolJSON struct {
+	Name        string `json:"name"`
+	Description string `json:"description"`
+	Audience    string `json:"audience"`
+}
+
+type callJSON struct {
+	ID       string `json:"id"`
+	State    string `json:"state"`
+	Progress *struct {
+		Progress float64 `json:"progress"`
+		Total    float64 `json:"total"`
+		Message  string  `json:"message"`
+	} `json:"progress"`
+	Result *struct {
+		Text       string          `json:"text"`
+		Structured json.RawMessage `json:"structured"`
+	} `json:"result"`
+	Error *struct {
+		Code    string `json:"code"`
+		Message string `json:"message"`
+	} `json:"error"`
+}
+
 // cmdToolList prints every tool of the running homed, admin tools included.
 func cmdToolList(args []string, stdout, stderr io.Writer) error {
 	fl, dataDir := newFlags("tool list", stderr)
-	if pos, err := parseFlags(fl, args); err != nil {
+	if err := noArgs(fl, args); err != nil {
 		return err
-	} else if len(pos) > 0 {
-		return fmt.Errorf("unexpected arguments: %v", pos)
 	}
 	dir, err := config.ResolveDataDir(*dataDir)
 	if err != nil {
 		return err
 	}
-	var tools []apiTool
-	if err := apiCall(dir, "GET", "/v1/tools", nil, &tools); err != nil {
+	ctx := context.Background()
+	c, err := connect(ctx, dir, false, stderr)
+	if err != nil {
 		return err
 	}
-	if len(tools) == 0 {
+	defer c.Close()
+	var tools struct {
+		Items []toolJSON `json:"items"`
+	}
+	if err := c.do(ctx, "GET", "/tools?audience=admin", nil, &tools); err != nil {
+		return err
+	}
+	if len(tools.Items) == 0 {
 		fmt.Fprintln(stdout, "No tools (yet): see homed plugin list.")
 		return nil
 	}
 	tw := tabwriter.NewWriter(stdout, 0, 0, 2, ' ', 0)
 	fmt.Fprintln(tw, "NAME\tAUDIENCE\tDESCRIPTION")
-	for _, t := range tools {
+	for _, t := range tools.Items {
 		desc, _, _ := strings.Cut(t.Description, "\n")
 		if r := []rune(desc); len(r) > 90 {
 			desc = string(r[:89]) + "…"
@@ -45,8 +78,9 @@ func cmdToolList(args []string, stdout, stderr io.Writer) error {
 	return tw.Flush()
 }
 
-// cmdToolCall calls one tool through the running homed (caller "admin", via "cli") and prints its text, then its
-// structured result as indented JSON. A tool that reports a failure makes homed exit with status 1.
+// cmdToolCall calls one tool through the running homed (the owner, via "cli"), prints its progress to stderr while it
+// runs, then its text and its structured result as indented JSON. A tool that reports a failure makes homed exit
+// with status 1.
 func cmdToolCall(args []string, stdout, stderr io.Writer) error {
 	fl, dataDir := newFlags("tool call", stderr)
 	pos, err := parseFlags(fl, args)
@@ -56,36 +90,88 @@ func cmdToolCall(args []string, stdout, stderr io.Writer) error {
 	if len(pos) < 1 || len(pos) > 2 {
 		return errors.New("usage: homed tool call <name> ['<json arguments>']")
 	}
-	body := []byte("{}")
+	name, arguments := pos[0], json.RawMessage(`{}`)
 	if len(pos) == 2 {
-		body = []byte(pos[1])
-		if !json.Valid(body) {
-			return errors.New("the arguments are not valid JSON")
+		var obj map[string]json.RawMessage
+		if err := json.Unmarshal([]byte(pos[1]), &obj); err != nil || obj == nil {
+			return errors.New("the arguments must be a JSON object")
 		}
+		arguments = json.RawMessage(pos[1])
 	}
 	dir, err := config.ResolveDataDir(*dataDir)
 	if err != nil {
 		return err
 	}
-	var res apiResult
-	if err := apiCall(dir, "POST", "/v1/tools/"+url.PathEscape(pos[0]), body, &res); err != nil {
+	ctx := context.Background()
+	c, err := connect(ctx, dir, false, stderr)
+	if err != nil {
 		return err
 	}
+	defer c.Close()
+	var call callJSON
+	err = c.do(ctx, "POST", "/tools/"+url.PathEscape(name)+"/calls", map[string]json.RawMessage{"args": arguments}, &call)
+	switch {
+	case isCode(err, "unknown_tool"):
+		return fmt.Errorf("unknown tool %s (see homed tool list)", name)
+	case err != nil:
+		return err
+	}
+	if err := followCall(ctx, c, &call, stderr); err != nil {
+		return err
+	}
+	switch call.State {
+	case "ok", "failed":
+	case "error":
+		if call.Error != nil {
+			return fmt.Errorf("%s (%s)", call.Error.Message, call.Error.Code)
+		}
+		return errors.New("the call could not run")
+	default:
+		return fmt.Errorf("the call ended %s", call.State)
+	}
 	out := stdout
-	if res.IsError {
+	if call.State == "failed" {
 		out = stderr
 	}
-	if res.Text != "" {
-		fmt.Fprintln(out, res.Text)
-	}
-	if len(res.Structured) > 0 {
+	if call.Result != nil {
+		if call.Result.Text != "" {
+			fmt.Fprintln(out, call.Result.Text)
+		}
 		var buf bytes.Buffer
-		if json.Indent(&buf, res.Structured, "", "  ") == nil {
+		if len(call.Result.Structured) > 0 && json.Indent(&buf, call.Result.Structured, "", "  ") == nil {
 			fmt.Fprintln(stdout, buf.String())
 		}
 	}
-	if res.IsError {
+	if call.State == "failed" {
 		return errToolFailed
 	}
 	return nil
+}
+
+// followCall polls a running call until it ends and prints each new progress message to stderr.
+func followCall(ctx context.Context, c *apiClient, call *callJSON, stderr io.Writer) error {
+	tick := time.NewTicker(200 * time.Millisecond)
+	defer tick.Stop()
+	shown := ""
+	for {
+		if p := call.Progress; p != nil && p.Message != "" && p.Message != shown {
+			shown = p.Message
+			if p.Total > 0 {
+				fmt.Fprintf(stderr, "… %s (%g/%g)\n", p.Message, p.Progress, p.Total)
+			} else {
+				fmt.Fprintf(stderr, "… %s\n", p.Message)
+			}
+		}
+		if call.State != "running" {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-tick.C:
+		}
+		if err := c.do(ctx, "GET", "/calls/"+url.PathEscape(call.ID), nil, call); err != nil {
+			return err
+		}
+	}
 }

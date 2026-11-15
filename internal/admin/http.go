@@ -280,7 +280,11 @@ func (s *Server) checkCSRF(r *http.Request) error {
 	if r.Header.Get(csrfHeader) != "1" {
 		return failed
 	}
-	if o := r.Header.Get("Origin"); o != "" && (s.opts.Origin == "" || o != s.opts.Origin) {
+	origin := s.opts.Origin
+	if s.opts.OriginFunc != nil {
+		origin = s.opts.OriginFunc()
+	}
+	if o := r.Header.Get("Origin"); o != "" && (origin == "" || o != origin) {
 		return failed
 	}
 	if sf := r.Header.Get("Sec-Fetch-Site"); sf != "" && sf != "same-origin" {

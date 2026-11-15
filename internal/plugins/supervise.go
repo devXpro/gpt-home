@@ -49,7 +49,7 @@ func (h *Host) supervise(ctx context.Context, p *plugin) {
 		} else {
 			backoff = min(backoff*2, t.backoffMax)
 		}
-		h.setState(p, state, err.Error())
+		h.setFailed(p, state, err.Error())
 		h.log.Warn("plugin stopped unexpectedly", "plugin", p.id, "err", err, "restart_in", delay, "state", state)
 		p.logs.event("stopped: %v; restart in %v", err, delay)
 

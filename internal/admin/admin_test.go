@@ -32,7 +32,7 @@ type env struct {
 	local *httptest.Server
 }
 
-func newEnv(t *testing.T) *env {
+func newEnv(t *testing.T, mods ...func(*Options)) *env {
 	t.Helper()
 	st := newMemStore()
 	created := time.Date(2026, 11, 1, 10, 0, 0, 0, time.UTC)
@@ -62,11 +62,15 @@ func newEnv(t *testing.T) *env {
 		keys:  &fakeKeys{},
 	}
 	e.aw = NewAuditWriter(st.Audit(), st.People(), nil)
-	s, err := newServer(Options{
+	opts := Options{
 		Store: st, Host: e.host, Auth: auth, Relay: e.relay, Installer: e.inst, Keys: e.keys, Audit: e.aw,
 		WithProgress: testWithProgress, Origin: origin, InstanceID: "inst-1", Version: "0.2.0",
 		StartedAt: created, LocalName: "devxpro",
-	}, func(s *Server) {
+	}
+	for _, mod := range mods {
+		mod(&opts)
+	}
+	s, err := newServer(opts, func(s *Server) {
 		s.pollEvery = 20 * time.Millisecond
 		s.pingEvery = 50 * time.Millisecond
 		s.logsEvery = 20 * time.Millisecond

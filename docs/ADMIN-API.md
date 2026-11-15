@@ -503,10 +503,12 @@ Each `link` call revokes the older setup links. The link is valid 15 minutes and
   | `POST /plugins` with `{"source":"local","id":"tv","command":["/…/gpt-tv","serve"]}` | | `201 PluginSummary` (`homed plugin add`); the web can only install from GitHub |
   | `PUT /relay` with a code for any domain | | `202 RelayStatus` (`homed relay connect`) |
 
-- **Phase 1 → phase 2.** T1.3's socket serves `GET /v1/tools`, `POST /v1/tools/{name}`, `GET /v1/plugins`,
-  `GET /v1/relay` and `POST /v1/reload`. In phase 2 (T2.3 builds the routes, T2.6 switches the CLI) they become
-  `GET /api/admin/tools?audience=admin`, `POST /api/admin/tools/{name}/calls?wait=1` with `{"args":{…}}` answering
-  `Call`, `GET /api/admin/plugins`, `GET /api/admin/relay`; `/v1/reload` goes away because the store is read live.
+- **Phase 1 → phase 2.** T1.3's socket served `GET /v1/tools`, `POST /v1/tools/{name}`, `GET /v1/plugins`,
+  `GET /v1/relay` and `POST /v1/reload`. Since T2.6 the socket serves only `/api/admin/*` and the CLI uses
+  `GET /api/admin/tools?audience=admin`, `POST /api/admin/tools/{name}/calls` with `{"args":{…}}` (then polls
+  `GET /calls/{id}` to show the progress), `GET /api/admin/plugins`, `GET /api/admin/relay`, and the key, plugin,
+  relay and `/local/*` endpoints above; `/v1/reload` is gone because the store is read live (SIGHUP re-reads it).
+  While homed is stopped, the CLI serves the same socket routes in-process over the data dir.
 
 ## 7. Admin audit actions
 `kind: "admin"` records, `via` = `admin` or `cli`. `target` in brackets.

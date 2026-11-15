@@ -7,31 +7,43 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"runtime/debug"
+
+	"github.com/devXpro/gpt-home/internal/install"
 )
 
-// version is set at build time with -ldflags "-X main.version=…".
-var version = "dev"
+// version and commit are set at build time with -ldflags "-X main.version=… -X main.commit=…".
+var (
+	version = "dev"
+	commit  = ""
+)
 
 const usage = `homed — the GPT-Home hub
 
 Daemon:
-  homed run [--listen 127.0.0.1:8080]          serve the gateway, the plugins, the relay and the local socket
+  homed run [--listen 127.0.0.1:8080] [--setup-listen 0.0.0.0:8090] [--dev-origin http://localhost:5173]
+                                               serve the hub, the admin (/admin), the plugins, the relay and the
+                                               local socket; until the home has an owner, also the first-run page
+
+First run and access (the home box only):
+  homed admin setup-link                       print a one-time link that adds a passkey for the owner (15 min)
+  homed admin reset-access                     delete every passkey and session, print a new setup link
 
 Relay:
   homed relay connect <- | code>               store a connect code; "-" reads it from stdin and keeps it
                                                out of shell history and the process list
   homed relay status                           connection and self-check of the running homed
 
-Person keys (stored in homed.yaml as hashes; a running homed picks up changes at once):
-  homed key new --person ID [--name NAME] [--label TEXT] [--plugins tv,…] [--keychain SERVICE]
-                                               print a new key once, or save it to the macOS Keychain
+Person keys (for ChatGPT Sites; the key itself is shown once):
+  homed key new [--person ID] [--label TEXT] [--keychain SERVICE]
+                                               print a new key, or save it to the macOS Keychain
   homed key list
-  homed key revoke <key id prefix>
+  homed key revoke <key id>
 
-Plugins (a running homed needs a restart to apply):
-  homed plugin add --id ID -- <command> [args…]
+Plugins:
+  homed plugin add --id ID -- <command> [args…] add a plugin from this machine (a running homed starts it)
   homed plugin list
-  homed plugin remove <id>
+  homed plugin remove [--delete-data] <id>
 
 Tools (through the running homed; every tool, admin ones included):
   homed tool list
@@ -39,8 +51,9 @@ Tools (through the running homed; every tool, admin ones included):
 
   homed version
 
-Every command takes --data-dir D. The data dir defaults to ~/Library/Application Support/gpt-home (macOS) or
-$XDG_DATA_HOME/gpt-home (Linux); HOMED_DATA_DIR overrides the default.
+The CLI talks to the running homed over <data dir>/homed.sock. Without a running homed, the admin, relay connect,
+key and plugin commands work on the data dir directly. Every command takes --data-dir D. The data dir defaults to
+~/Library/Application Support/gpt-home (macOS) or $XDG_DATA_HOME/gpt-home (Linux); HOMED_DATA_DIR overrides it.
 `
 
 // errToolFailed is returned when a tool ran and reported a failure; homed exits with status 1 for it.
@@ -50,6 +63,9 @@ func main() {
 	err := run(os.Args[1:], os.Stdin, os.Stdout, os.Stderr)
 	switch {
 	case err == nil:
+	case errors.Is(err, errRestart):
+		// After a hub update: the service manager (launchd KeepAlive, systemd Restart=) starts the new binary.
+		os.Exit(install.ExitCodeRestart)
 	case errors.Is(err, errToolFailed):
 		os.Exit(1)
 	case errors.Is(err, flag.ErrHelp):
@@ -73,6 +89,10 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
 	switch {
 	case cmd == "run":
 		return cmdRun(rest, stderr)
+	case cmd == "admin" && sub == "setup-link":
+		return cmdAdminSetupLink(rest[1:], stdout, stderr)
+	case cmd == "admin" && sub == "reset-access":
+		return cmdAdminResetAccess(rest[1:], stdout, stderr)
 	case cmd == "relay" && sub == "connect":
 		return cmdRelayConnect(rest[1:], stdin, stdout, stderr)
 	case cmd == "relay" && sub == "status":
@@ -107,10 +127,25 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
 
 func joinCmd(cmd, sub string) string {
 	switch cmd {
-	case "relay", "key", "plugin", "tool":
+	case "admin", "relay", "key", "plugin", "tool":
 		return cmd + " " + sub
 	}
 	return cmd
+}
+
+// buildCommit is the -ldflags commit, else the VCS revision Go stamped into the binary (short), else "".
+func buildCommit() string {
+	if commit != "" {
+		return commit
+	}
+	if bi, ok := debug.ReadBuildInfo(); ok {
+		for _, s := range bi.Settings {
+			if s.Key == "vcs.revision" && len(s.Value) >= 7 {
+				return s.Value[:7]
+			}
+		}
+	}
+	return ""
 }
 
 // newFlags returns a flag set with the --data-dir flag every command takes.
@@ -139,4 +174,16 @@ func parseFlags(fl *flag.FlagSet, args []string) ([]string, error) {
 		pos = append(pos, rest[0])
 		args = rest[1:]
 	}
+}
+
+// noArgs parses flags for a command that takes no positional arguments.
+func noArgs(fl *flag.FlagSet, args []string) error {
+	pos, err := parseFlags(fl, args)
+	if err != nil {
+		return err
+	}
+	if len(pos) > 0 {
+		return fmt.Errorf("unexpected arguments: %v", pos)
+	}
+	return nil
 }

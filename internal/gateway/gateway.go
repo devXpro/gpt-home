@@ -66,8 +66,16 @@ type principal struct {
 
 type principalKey struct{}
 
+// Handler is the gateway: the http.Handler of §5.4, whose home name may change while it serves.
+type Handler interface {
+	http.Handler
+	// SetHomeName changes the home name in the instructions and the MCP title; the next request sees it. homed calls
+	// it when the owner names or renames the home in the admin.
+	SetHomeName(name string)
+}
+
 // New returns the handler for §5.4. audit may be nil.
-func New(host hub.ToolHost, keyResolver hub.KeyResolver, audit hub.Auditor, opts Options) http.Handler {
+func New(host hub.ToolHost, keyResolver hub.KeyResolver, audit hub.Auditor, opts Options) Handler {
 	if opts.RateLimit <= 0 {
 		opts.RateLimit = defaultRateLimit
 	}
@@ -114,6 +122,17 @@ func New(host hub.ToolHost, keyResolver hub.KeyResolver, audit hub.Auditor, opts
 	})
 	g.mux.Handle("/mcp", g.authenticate(withTokenInfo(mcpHandler)))
 	return g
+}
+
+// SetHomeName implements Handler. The tool snapshot is rebuilt on the next request, so the version fingerprint moves
+// too and ChatGPT reloads the instructions.
+func (g *gateway) SetHomeName(name string) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.opts.HomeName != name {
+		g.opts.HomeName = name
+		g.snap = nil
+	}
 }
 
 func (g *gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {

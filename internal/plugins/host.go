@@ -43,12 +43,16 @@ type Host struct {
 
 	log     *slog.Logger
 	dataDir string
-	plugins []*plugin // sorted by id; fixed after New
 	timing  timing
 
+	// lifecycle serializes Add, Remove, Restart and Sync, which stop a supervisor and wait for it outside mu.
+	lifecycle sync.Mutex
+
 	mu       sync.Mutex
+	plugins  []*plugin     // sorted by id; changed by Add, Remove and Sync
 	changed  chan struct{} // closed at the next change of the tool set
 	statusCh chan struct{} // closed at the next status change (tests wait on it)
+	ctx      context.Context
 	cancel   context.CancelFunc
 	closed   bool
 	wg       sync.WaitGroup
@@ -80,12 +84,17 @@ var defaultTiming = timing{
 	rpcTimeout:   30 * time.Second,
 }
 
-// plugin is one supervised plugin. Fields below mu are guarded by Host.mu.
+// plugin is one supervised plugin. Fields below logs are guarded by Host.mu; command changes only while no
+// supervisor runs.
 type plugin struct {
 	id      string
 	command []string
 	dir     string // GPT_HOME_DATA_DIR and cwd
 	logs    *logSink
+
+	stop   context.CancelFunc // stops the current supervisor; nil while none runs
+	done   chan struct{}      // closed when the current supervisor has returned
+	failed bool               // the latest run failed and none has come up since the supervisor started
 
 	state        hub.PluginState
 	lastErr      string
@@ -114,43 +123,65 @@ func New(specs []Spec, dataDir string, log *slog.Logger) (*Host, error) {
 		changed:    make(chan struct{}),
 		statusCh:   make(chan struct{}),
 	}
-	logDir := filepath.Join(dataDir, "logs")
-	if err := mkdir0700(logDir); err != nil {
+	if err := mkdir0700(h.logDir()); err != nil {
 		return nil, err
 	}
 	seen := map[string]bool{}
-	now := time.Now()
 	for _, s := range specs {
-		if !pluginIDRe.MatchString(s.ID) {
-			return nil, fmt.Errorf("plugin id %q must match %s", s.ID, pluginIDRe)
+		p, err := h.newPlugin(s)
+		if err != nil {
+			return nil, err
 		}
 		if seen[s.ID] {
 			return nil, fmt.Errorf("plugin id %q is used twice", s.ID)
 		}
 		seen[s.ID] = true
-		if len(s.Command) == 0 || s.Command[0] == "" {
-			return nil, fmt.Errorf("plugin %q: empty command", s.ID)
-		}
-		command := slices.Clone(s.Command)
-		// The plugin runs in its data dir, so a relative path to the binary is resolved against ours now.
-		if strings.ContainsRune(command[0], filepath.Separator) && !filepath.IsAbs(command[0]) {
-			abs, err := filepath.Abs(command[0])
-			if err != nil {
-				return nil, err
-			}
-			command[0] = abs
-		}
-		h.plugins = append(h.plugins, &plugin{
-			id:      s.ID,
-			command: command,
-			dir:     filepath.Join(dataDir, "plugins", s.ID, "data"),
-			logs:    newLogSink(filepath.Join(logDir, s.ID+".log"), log.With("plugin", s.ID)),
-			state:   hub.PluginStopped,
-			since:   now,
-		})
+		h.plugins = append(h.plugins, p)
 	}
-	slices.SortFunc(h.plugins, func(a, b *plugin) int { return strings.Compare(a.id, b.id) })
+	sortPlugins(h.plugins)
 	return h, nil
+}
+
+func (h *Host) logDir() string { return filepath.Join(h.dataDir, "logs") }
+
+// newPlugin validates a spec and returns its stopped plugin.
+func (h *Host) newPlugin(s Spec) (*plugin, error) {
+	if !pluginIDRe.MatchString(s.ID) {
+		return nil, fmt.Errorf("plugin id %q must match %s", s.ID, pluginIDRe)
+	}
+	command, err := absCommand(s)
+	if err != nil {
+		return nil, err
+	}
+	return &plugin{
+		id:      s.ID,
+		command: command,
+		dir:     filepath.Join(h.dataDir, "plugins", s.ID, "data"),
+		logs:    newLogSink(filepath.Join(h.logDir(), s.ID+".log"), h.log.With("plugin", s.ID)),
+		state:   hub.PluginStopped,
+		since:   time.Now(),
+	}, nil
+}
+
+// absCommand checks the spec's command and resolves a relative path to the binary against our working directory, as
+// the plugin runs in its data dir.
+func absCommand(s Spec) ([]string, error) {
+	if len(s.Command) == 0 || s.Command[0] == "" {
+		return nil, fmt.Errorf("plugin %q: empty command", s.ID)
+	}
+	command := slices.Clone(s.Command)
+	if strings.ContainsRune(command[0], filepath.Separator) && !filepath.IsAbs(command[0]) {
+		abs, err := filepath.Abs(command[0])
+		if err != nil {
+			return nil, err
+		}
+		command[0] = abs
+	}
+	return command, nil
+}
+
+func sortPlugins(list []*plugin) {
+	slices.SortFunc(list, func(a, b *plugin) int { return strings.Compare(a.id, b.id) })
 }
 
 func buildVersion() string {
@@ -175,11 +206,22 @@ func (h *Host) Start(ctx context.Context) {
 	if h.cancel != nil || h.closed {
 		return
 	}
-	ctx, h.cancel = context.WithCancel(ctx)
+	h.ctx, h.cancel = context.WithCancel(ctx)
 	for _, p := range h.plugins {
-		h.wg.Add(1)
-		go h.supervise(ctx, p)
+		h.superviseLocked(p)
 	}
+}
+
+// superviseLocked starts a supervisor for p. h.mu is held; the host has started and is not closed.
+func (h *Host) superviseLocked(p *plugin) {
+	ctx, stop := context.WithCancel(h.ctx)
+	done := make(chan struct{})
+	p.stop, p.done, p.failed = stop, done, false
+	h.wg.Add(1)
+	go func() {
+		defer close(done)
+		h.supervise(ctx, p)
+	}()
 }
 
 // Close stops every plugin (closing the session, then SIGTERM, then SIGKILL after 5 s) and waits for them.
@@ -192,7 +234,10 @@ func (h *Host) Close() {
 		cancel()
 	}
 	h.wg.Wait()
-	for _, p := range h.plugins {
+	h.mu.Lock()
+	list := slices.Clone(h.plugins)
+	h.mu.Unlock()
+	for _, p := range list {
 		p.logs.close()
 	}
 }
@@ -259,9 +304,20 @@ func (h *Host) Status() []hub.PluginStatus {
 // Logs returns the last lines (at most 1000) a plugin wrote to stderr, oldest first, with the host's own events
 // prefixed by "gpt-home:". It returns nil for an unknown id.
 func (h *Host) Logs(id string) []string {
+	h.mu.Lock()
+	p := h.findLocked(id)
+	h.mu.Unlock()
+	if p == nil {
+		return nil
+	}
+	return p.logs.lines()
+}
+
+// findLocked returns the plugin with the id, or nil. h.mu is held.
+func (h *Host) findLocked(id string) *plugin {
 	for _, p := range h.plugins {
 		if p.id == id {
-			return p.logs.lines()
+			return p
 		}
 	}
 	return nil
@@ -357,6 +413,18 @@ func toResult(res *mcp.CallToolResult) (hub.Result, error) {
 func (h *Host) setState(p *plugin, state hub.PluginState, lastErr string) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	h.setStateLocked(p, state, lastErr)
+}
+
+// setFailed records a run that ended in failure: the state it waits in for the restart, and Await's verdict.
+func (h *Host) setFailed(p *plugin, state hub.PluginState, lastErr string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	p.failed = true
+	h.setStateLocked(p, state, lastErr)
+}
+
+func (h *Host) setStateLocked(p *plugin, state hub.PluginState, lastErr string) {
 	if state != hub.PluginUp {
 		p.session = nil
 	}
@@ -375,6 +443,7 @@ func (h *Host) setUp(p *plugin, cs *mcp.ClientSession, info *mcp.InitializeResul
 	p.session = cs
 	p.state = hub.PluginUp
 	p.lastErr = ""
+	p.failed = false
 	p.since = time.Now()
 	p.title, p.version = "", ""
 	if si := info.ServerInfo; si != nil {

@@ -1,126 +1,166 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
+	"net/url"
 	"strings"
 	"text/tabwriter"
 	"time"
-	"unicode"
-	"unicode/utf8"
 
 	"github.com/devXpro/gpt-home/internal/config"
-	"github.com/devXpro/gpt-home/internal/keys"
 )
 
-// keyIDLen is how many hex characters of a key's sha256 `key list` shows as the key id.
-const keyIDLen = 12
-
-// minRevokePrefix keeps `key revoke` from matching by accident.
+// minRevokePrefix keeps `key revoke` from matching by accident when only the start of a key id is given.
 const minRevokePrefix = 6
 
-// cmdKeyNew issues a person key: the hash goes into homed.yaml, the key itself is printed once to stdout (and
-// nothing else is), or with --keychain saved to the macOS Keychain without ever being shown.
+// keyJSON is Key and personJSON is Person (ADMIN-API §2), as far as the CLI shows them.
+type keyJSON struct {
+	ID         string     `json:"id"`
+	PersonID   string     `json:"personId"`
+	Label      string     `json:"label"`
+	Hint       string     `json:"hint"`
+	CreatedAt  time.Time  `json:"createdAt"`
+	LastUsedAt *time.Time `json:"lastUsedAt"`
+}
+
+type personJSON struct {
+	ID      string   `json:"id"`
+	Name    string   `json:"name"`
+	Role    string   `json:"role"`
+	Plugins []string `json:"plugins"`
+}
+
+// cmdKeyNew issues a person key. The key itself is printed once to stdout (and nothing else is), or with --keychain
+// saved to the macOS Keychain without ever being shown; homed keeps only its hash.
 func cmdKeyNew(args []string, stdout, stderr io.Writer) error {
 	fl, dataDir := newFlags("key new", stderr)
-	personID := fl.String("person", "", "person id, e.g. roman (created when new)")
-	name := fl.String("name", "", "display name (default: the existing name, or the id capitalized)")
-	label := fl.String("label", "", "what the key is for, e.g. \"ChatGPT Site\"")
-	pluginList := fl.String("plugins", "", "comma-separated plugin ids the person may use, or * (default: unchanged, * for a new person)")
+	personID := fl.String("person", "", "person id (default: the owner)")
+	label := fl.String("label", "ChatGPT Site", "what the key is for")
 	keychain := fl.String("keychain", "", "macOS only: save the key to this Keychain item (account = person id) instead of printing it")
-	if pos, err := parseFlags(fl, args); err != nil {
+	if err := noArgs(fl, args); err != nil {
 		return err
-	} else if len(pos) > 0 {
-		return fmt.Errorf("unexpected arguments: %v", pos)
-	}
-	if *personID == "" {
-		return errors.New("--person is required")
 	}
 	dir, err := config.ResolveDataDir(*dataDir)
 	if err != nil {
 		return err
 	}
-
-	key, hash := keys.Generate()
-	var displayName string
-	err = config.Update(dir, func(c *config.Config) error {
-		p := c.Person(*personID)
-		if p == nil {
-			c.People = append(c.People, config.Person{ID: *personID, Name: capitalize(*personID), Plugins: []string{"*"}})
-			p = &c.People[len(c.People)-1]
-		}
-		if *name != "" {
-			p.Name = *name
-		}
-		if *pluginList != "" {
-			p.Plugins = splitList(*pluginList)
-		}
-		p.Keys = append(p.Keys, config.Key{SHA256: hash, Label: *label, Created: time.Now().UTC().Truncate(time.Second)})
-		displayName = p.Name
-		if err := c.Validate(); err != nil {
-			return err
-		}
-		// Into the Keychain before homed.yaml is written: a failure there leaves nothing behind.
-		if *keychain != "" {
-			return keychainStore(*keychain, *personID, key)
-		}
-		return nil
-	})
+	ctx := context.Background()
+	c, err := connect(ctx, dir, true, stderr)
 	if err != nil {
 		return err
 	}
-
-	id := hash[:keyIDLen]
-	if *keychain != "" {
-		fmt.Fprintf(stdout, "New key %s for %s saved to Keychain item %q (account %s).\n", id, displayName, *keychain, *personID)
-	} else {
-		fmt.Fprintf(stderr, "New key %s for %s. It is shown only this once; homed keeps only its hash:\n", id, displayName)
-		fmt.Fprintln(stdout, key)
+	defer c.Close()
+	person, err := findPerson(ctx, c, *personID)
+	if err != nil {
+		return err
 	}
-	notifyReload(dir, stderr, "the key works at its next start")
+	var res struct {
+		Key    keyJSON `json:"key"`
+		Secret string  `json:"secret"`
+	}
+	if err := c.do(ctx, "POST", "/people/"+url.PathEscape(person.ID)+"/keys", map[string]string{"label": *label}, &res); err != nil {
+		return err
+	}
+	if *keychain != "" {
+		if err := keychainStore(*keychain, person.ID, res.Secret); err != nil {
+			// Nobody holds the key now: take it back.
+			if derr := c.do(ctx, "DELETE", "/keys/"+url.PathEscape(res.Key.ID), nil, nil); derr != nil {
+				fmt.Fprintf(stderr, "Warning: revoke the unused key %s by hand: %v\n", res.Key.ID, derr)
+			}
+			return err
+		}
+		fmt.Fprintf(stdout, "New key %s for %s saved to Keychain item %q (account %s).\n", res.Key.ID, person.Name, *keychain, person.ID)
+	} else {
+		fmt.Fprintf(stderr, "New key %s for %s. It is shown only this once; homed keeps only its hash:\n", res.Key.ID, person.Name)
+		fmt.Fprintln(stdout, res.Secret)
+	}
+	if c.offline {
+		fmt.Fprintln(stderr, "homed is not running; the key works once it starts.")
+	}
 	return nil
 }
 
-// cmdKeyList prints every key by its id (the start of its hash); keys themselves are never stored.
+// findPerson returns the person with the id, or the owner when id is empty.
+func findPerson(ctx context.Context, c *apiClient, id string) (personJSON, error) {
+	var people struct {
+		Items []personJSON `json:"items"`
+	}
+	if err := c.do(ctx, "GET", "/people", nil, &people); err != nil {
+		return personJSON{}, err
+	}
+	for _, p := range people.Items {
+		if p.ID == id || id == "" && p.Role == "owner" {
+			return p, nil
+		}
+	}
+	if id == "" {
+		return personJSON{}, errors.New("the home has no owner yet: finish the setup first (homed admin setup-link)")
+	}
+	return personJSON{}, fmt.Errorf("no person %q (see homed key list); people come from the setup link and invites", id)
+}
+
+// cmdKeyList prints every key by its id; keys themselves are never stored.
 func cmdKeyList(args []string, stdout, stderr io.Writer) error {
 	fl, dataDir := newFlags("key list", stderr)
-	if pos, err := parseFlags(fl, args); err != nil {
+	if err := noArgs(fl, args); err != nil {
 		return err
-	} else if len(pos) > 0 {
-		return fmt.Errorf("unexpected arguments: %v", pos)
 	}
 	dir, err := config.ResolveDataDir(*dataDir)
 	if err != nil {
 		return err
 	}
-	cfg, err := config.Load(dir)
+	ctx := context.Background()
+	c, err := connect(ctx, dir, true, stderr)
 	if err != nil {
 		return err
 	}
-	if len(cfg.People) == 0 {
-		fmt.Fprintln(stdout, "No people yet; add one with: homed key new --person ID --name NAME")
+	defer c.Close()
+	var people struct {
+		Items []personJSON `json:"items"`
+	}
+	if err := c.do(ctx, "GET", "/people", nil, &people); err != nil {
+		return err
+	}
+	list, err := keyList(ctx, c)
+	if err != nil {
+		return err
+	}
+	if len(list) == 0 {
+		fmt.Fprintln(stdout, "No keys yet; make one with: homed key new")
 		return nil
 	}
+	names := map[string]string{}
+	for _, p := range people.Items {
+		names[p.ID] = p.Name
+	}
 	tw := tabwriter.NewWriter(stdout, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(tw, "PERSON\tNAME\tPLUGINS\tKEY ID\tLABEL\tCREATED")
-	for _, p := range cfg.People {
-		plugins := strings.Join(p.Plugins, ",")
-		if len(p.Keys) == 0 {
-			fmt.Fprintf(tw, "%s\t%s\t%s\t-\t\t\n", p.ID, p.Name, plugins)
+	fmt.Fprintln(tw, "KEY ID\tPERSON\tLABEL\tSTARTS WITH\tCREATED\tLAST USED")
+	for _, k := range list {
+		hint, used := "-", "-"
+		if k.Hint != "" {
+			hint = k.Hint + "…"
 		}
-		for _, k := range p.Keys {
-			created := ""
-			if !k.Created.IsZero() {
-				created = k.Created.Local().Format(time.DateTime)
-			}
-			fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\n", p.ID, p.Name, plugins, k.SHA256[:keyIDLen], k.Label, created)
+		if k.LastUsedAt != nil {
+			used = k.LastUsedAt.Local().Format(time.DateTime)
 		}
+		fmt.Fprintf(tw, "%s\t%s (%s)\t%s\t%s\t%s\t%s\n", k.ID, names[k.PersonID], k.PersonID, k.Label, hint,
+			k.CreatedAt.Local().Format(time.DateTime), used)
 	}
 	return tw.Flush()
 }
 
-// cmdKeyRevoke removes the one key whose hash starts with the given key id prefix.
+func keyList(ctx context.Context, c *apiClient) ([]keyJSON, error) {
+	var keys struct {
+		Items []keyJSON `json:"items"`
+	}
+	err := c.do(ctx, "GET", "/keys", nil, &keys)
+	return keys.Items, err
+}
+
+// cmdKeyRevoke revokes one key, named by its id or a unique start of it.
 func cmdKeyRevoke(args []string, stdout, stderr io.Writer) error {
 	fl, dataDir := newFlags("key revoke", stderr)
 	pos, err := parseFlags(fl, args)
@@ -128,80 +168,51 @@ func cmdKeyRevoke(args []string, stdout, stderr io.Writer) error {
 		return err
 	}
 	if len(pos) != 1 {
-		return errors.New("usage: homed key revoke <key id prefix> (see homed key list)")
-	}
-	prefix := strings.ToLower(pos[0])
-	if len(prefix) < minRevokePrefix {
-		return fmt.Errorf("give at least %d characters of the key id", minRevokePrefix)
+		return errors.New("usage: homed key revoke <key id> (see homed key list)")
 	}
 	dir, err := config.ResolveDataDir(*dataDir)
 	if err != nil {
 		return err
 	}
-	var revoked string
-	err = config.Update(dir, func(c *config.Config) error {
-		matches := 0
-		for i := range c.People {
-			for _, k := range c.People[i].Keys {
-				if strings.HasPrefix(k.SHA256, prefix) {
-					matches++
-				}
-			}
-		}
-		switch {
-		case matches == 0:
-			return fmt.Errorf("no key id starts with %q (see homed key list)", prefix)
-		case matches > 1:
-			return fmt.Errorf("%d keys start with %q; give more characters", matches, prefix)
-		}
-		for i := range c.People {
-			p := &c.People[i]
-			for j, k := range p.Keys {
-				if strings.HasPrefix(k.SHA256, prefix) {
-					p.Keys = append(p.Keys[:j], p.Keys[j+1:]...)
-					revoked = fmt.Sprintf("%s of %s", k.SHA256[:keyIDLen], p.Name)
-					return nil
-				}
-			}
-		}
-		return nil
-	})
+	ctx := context.Background()
+	c, err := connect(ctx, dir, true, stderr)
 	if err != nil {
 		return err
 	}
-	fmt.Fprintf(stdout, "Revoked key %s.\n", revoked)
-	notifyReload(dir, stderr, "the change applies at its next start")
+	defer c.Close()
+	list, err := keyList(ctx, c)
+	if err != nil {
+		return err
+	}
+	k, err := matchKey(list, pos[0])
+	if err != nil {
+		return err
+	}
+	if err := c.do(ctx, "DELETE", "/keys/"+url.PathEscape(k.ID), nil, nil); err != nil {
+		return err
+	}
+	fmt.Fprintf(stdout, "Revoked key %s (%s of %s).\n", k.ID, k.Label, k.PersonID)
 	return nil
 }
 
-// notifyReload asks a running homed to re-read people and keys.
-func notifyReload(dir string, stderr io.Writer, notRunning string) {
-	var res apiReload
-	err := apiCall(dir, "POST", "/v1/reload", nil, &res)
+// matchKey finds the key whose id is ref, or the one key whose id starts with ref (at least 6 characters).
+func matchKey(list []keyJSON, ref string) (keyJSON, error) {
+	var found []keyJSON
+	for _, k := range list {
+		if k.ID == ref {
+			return k, nil
+		}
+		if strings.HasPrefix(k.ID, ref) {
+			found = append(found, k)
+		}
+	}
 	switch {
-	case err == nil:
-		fmt.Fprintln(stderr, "The running homed picked up the change.")
-		if len(res.RestartNeeded) > 0 {
-			fmt.Fprintf(stderr, "Restart homed to apply the other changes in homed.yaml: %s.\n", strings.Join(res.RestartNeeded, ", "))
-		}
-	case errors.Is(err, errNotRunning):
-		fmt.Fprintf(stderr, "homed is not running; %s.\n", notRunning)
-	default:
-		fmt.Fprintf(stderr, "Warning: the running homed did not reload (%v); restart it to apply the change.\n", err)
+	case len(ref) < minRevokePrefix:
+		return keyJSON{}, fmt.Errorf("no key %q; give the whole key id or at least %d characters of it (see homed key list)", ref, minRevokePrefix)
+	case len(found) == 0:
+		return keyJSON{}, fmt.Errorf("no key id starts with %q (see homed key list)", ref)
+	case len(found) > 1:
+		return keyJSON{}, fmt.Errorf("%d key ids start with %q; give more characters", len(found), ref)
 	}
-}
-
-func capitalize(s string) string {
-	r, n := utf8.DecodeRuneInString(s)
-	return string(unicode.ToUpper(r)) + s[n:]
-}
-
-func splitList(s string) []string {
-	var out []string
-	for part := range strings.SplitSeq(s, ",") {
-		if part = strings.TrimSpace(part); part != "" {
-			out = append(out, part)
-		}
-	}
-	return out
+	return found[0], nil
 }

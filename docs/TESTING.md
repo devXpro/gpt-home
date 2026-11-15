@@ -70,7 +70,8 @@ the list and on calls, every row of the REST status table, the `/api/v1/tools` g
 (`internal/gateway/testdata/tools.golden.json`, checked against the keys `librus-gpt/site/core/mcp.mjs` reads), MCP
 list and call through a go-sdk client over HTTP, the `serverInfo.version` fingerprint following tool changes, the
 per-key rate limit (fake clock), audit entries and redaction, key generation and constant-time matching, and the JSONL
-audit files (monthly names, 0600, drop-on-overflow). No network.
+audit files (monthly names, 0600, drop-on-overflow), and a home name changed while serving (`TestSetHomeName`: the
+instructions, the MCP title and the fingerprint follow). No network.
 
 ```sh
 go test -race ./internal/gateway/... ./internal/keys/... ./internal/audit/...
@@ -139,26 +140,60 @@ go test -race ./pluginkit/... ./internal/plugins/...
 
 ### homed and its config (`cmd/homed`, `internal/config`)
 
-`internal/config`: loading and validating `homed.yaml` (unknown keys, loopback-only listen, relay domain, plugin and
-person ids, scopes, key hashes, duplicates), `Update` rewriting only changed top-level sections (comments and untouched
-sections survive; failed updates write nothing; 0600), the relay token (0600, loose modes refused), the instance id
-and the data dir resolution.
+`internal/config`: loading and validating `homed.yaml` (unknown keys, loopback-only listen, `setup_listen`, relay
+domain, the phase 1 sections' ids, scopes, key hashes, duplicates), `Update` rewriting only changed top-level sections
+(comments and untouched sections survive; failed updates write nothing; 0600), `ArchivePhase1` (the imported sections
+leave homed.yaml for `homed.yaml.phase1`, no backup is ever overwritten), the relay token (0600, loose modes refused),
+the instance id, the instance lock and the data dir resolution.
 
-`cmd/homed`: the CLI (`relay connect` incl. stdin, `key new/list/revoke`, `key new --keychain` against a fake
-`security` that must receive the key on stdin and never in argv, `plugin add/list/remove`, flags after positionals,
-commands needing a running homed), and the Host allowlist (relay domain with any port, `127.0.0.1`/`localhost`/`[::1]`
-with our port, 421 otherwise). `TestDaemon` is the T1.3 acceptance: it builds the fake plugin, runs `serve` in-process
-with a relay pointed at a closed local port, then: `key new` on the running homed (picked up at once over the socket),
-`GET /api/v1/tools` with that key (assistant tools of the person's scope only), the relay Host passing and a foreign
-Host getting 421, `tool list`/`tool call` through the socket (admin tools included, caller `admin` via `cli`, a failing
-tool exits 1, unknown tool, non-object arguments), `plugin list`, `relay status`, a second homed refused on the same data
-dir, `key revoke` taking effect at once, a clean shutdown removing the socket, and the audit lines with redaction. The
-tests set `HOMED_DATA_DIR` to a temp dir, so nothing touches the real data dir; data dirs live under `/tmp` because a
-unix socket path must fit in 103 bytes. About 2 s; no network, no Docker.
+`cmd/homed` (T2.6), all on temp data dirs under `/tmp` (a unix socket path must fit in 103 bytes) with
+`HOMED_DATA_DIR` pointing into a temp dir, so nothing touches the real data dir; no network, no Docker; about 25 s
+with `-race`:
+- `TestDaemon` is the acceptance: a phase 1 data dir (relay on a closed local port, the fake plugin, Roman with a key)
+  starts as a phase 2 homed. The import into homed.db and the archived homed.yaml; Roman's old key on the REST façade
+  (also with the relay's Host; a foreign Host gets 421); `/` → `/admin/`, the SPA (or its 503 hint before `make web`),
+  bootstrap and session; the CLI over the socket (`key list/new`, `tool list/call` as the owner via `cli`, a failing and
+  an unknown tool, `plugin list`, `relay status`); the first-run page (PIN from the terminal, cookie, `connecting`,
+  `relay_not_ready`); the owner's passkey from `homed admin setup-link`, registered with a virtual authenticator
+  (`descope/virtualwebauthn`) through the relay's origin; the new home name reaching the gateway at once and the
+  first-run page answering 410; a key created in the admin, used, revoked; an admin tool call with progress released
+  from the CLI; a rename of the home; the `echo` plugin added and removed while homed runs; a second homed refused; a
+  clean shutdown; the audit in homed.db with redaction.
+- `TestRelayConnectAtRunTime` (Host guard, passkey relying party and admin origin follow a relay connected while homed
+  runs), `TestDevMode` (`--dev-origin`: refused with a relay, localhost passkeys and links, no relay from the web, the
+  first-run page or the CLI), `TestRestartAfterHubUpdate` (serve returns `errRestart` → exit 75),
+  `TestRelayConfigErrorInStatus`.
+- `TestInstallerAdapter`: the admin's installer against an `httptest` TLS fake of GitHub with the real store and plugin
+  host: install (steps, store row, plugin up), a second install of the same plugin refused before it touches the
+  files, an update whose binary does not start (rolled back to the old row and binary), a good update, remove, and the
+  hub update ending in a restart request.
+- The CLI without a running homed (`TestOfflineCommands`: keys, plugins, `admin setup-link`/`reset-access`, through the
+  in-process admin API), `TestPhase1Import` (Roman's homed.yaml shape), `relay connect` (stdin, comments kept, the
+  domain-change hint, audit), `key new --keychain` against a fake `security` that must get the key on stdin and never in
+  argv (and a Keychain failure revoking the key), the Host guard, `--dev-origin` parsing, key id matching.
 
 ```sh
 go test -race ./cmd/homed/... ./internal/config/...
 ```
+
+### Real-homed end to end (`web/tests/real`, T2.6)
+
+Playwright against a **real** homed, nothing mocked. `global-setup.ts` builds homed (with the SPA that `make web`
+embedded) and the fake plugin into a fresh `/tmp/gh-e2e-*` dir, adds the plugin, and runs `homed run --dev-origin
+http://localhost:<port>` on a data dir there (127.0.0.1 only, free ports). One story, in Chromium with Chrome's
+virtual authenticator (real WebAuthn ceremonies): the LAN first-run page (the PIN homed printed, then the server code
+step, as there is no relay in development) → `homed admin setup-link` → the wizard and a passkey for `localhost` → the
+home → Устройства → Fake → a tool run from the admin with live progress, released by `homed tool call fake_release` →
+Настройки → Ключи доступа: a new key → `GET /api/v1/tools` and `POST /api/v1/tools/fake_echo` with it, as a Site would
+→ the call in Журнал → revoke → the key gets 401. CSP violations and page errors fail it. About 15 s after the builds;
+homed is stopped and the temp dir removed afterwards (`E2E_KEEP=1` keeps it for a look).
+
+```sh
+make e2e                          # make web, then the suite
+npm --prefix web run e2e:real     # the suite alone, when internal/web/dist is already built
+```
+
+Prerequisites: Go, Node 22+, `npx --prefix web playwright install chromium` once. No relay, no network after `npm ci`.
 
 ### SQLite store (`internal/store`)
 
@@ -191,6 +226,10 @@ go test -race ./internal/install/...
 ```
 
 - The plugin host tests also cover translated tool texts and progress (`TestToolI18n`, `TestCallProgress`, `TestParseI18n`, `TestDeliverProgress`; T2.7).
+- And run-time changes of the plugin set (T2.6): `Add`, `Restart`, `Remove` (the process has exited before it
+  returns, its tools are gone), `Sync` (unchanged plugins keep running, a new command restarts, invalid sets change
+  nothing), `Await` (up, a run that failed since the start, the context), adding before `Start` and after `Close`
+  (`TestAddRestartRemove`, `TestAddBeforeStartAndAfterClose`, `TestSync`, `TestAwait`).
 
 ### Admin API backend (`internal/admin`)
 
@@ -203,7 +242,8 @@ secret in lists or audit, passkeys and sessions of "me", tools/plugins/inventory
 validation into `fields`, 409 `call_running`, progress with `message_i18n`, `wait=1`, cancel, audit with redaction),
 audit paging with filter-bound cursors, relay state and the domain-change rule, jobs (409 `job_running`, step reports,
 coded failures), and SSE (hello, replay after `Last-Event-ID`, `resync` for another run or an id that left the
-500-event ring, member filtering, `plugin.log`, `plugin`, `tools`, `audit`, `session.revoked` on revoke and on expiry).
+500-event ring, member filtering, `plugin.log`, `plugin`, `tools`, `audit`, `session.revoked` on revoke and on expiry),
+and the CSRF origin read per request (`TestOriginFunc`, T2.6).
 About 2 s.
 
 ```sh

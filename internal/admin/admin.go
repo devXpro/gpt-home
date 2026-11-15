@@ -171,6 +171,9 @@ type Options struct {
 
 	// Origin is the only allowed Origin of a mutating web request, e.g. "https://homie.jobbyjobs.work".
 	Origin string
+	// OriginFunc, when set, replaces Origin and is read on every request, like the passkey relying party: a relay
+	// connected while homed runs (the first-run page, `homed relay connect`) is the admin's origin at once.
+	OriginFunc func() string
 	// InstanceID goes into X-GPT-Home-Instance on every response; empty sends nothing.
 	InstanceID string
 	Version    string // hub version, e.g. "0.2.0"; empty means "dev"

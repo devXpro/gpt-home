@@ -1,8 +1,13 @@
 // Package config reads and writes the hub's data dir (PLAN.md §5.6): homed.yaml, the relay token, the instance id
 // and the paths of the other files homed keeps there.
 //
+// From phase 2 on homed.yaml holds only what homed needs before its database opens: listen, setup_listen and the relay
+// domain. People, their key hashes, plugins and the home name live in homed.db. A phase 1 homed.yaml still has those
+// sections; homed imports them into the database once (store.ImportPhase1) and then ArchivePhase1 moves them out of
+// homed.yaml into homed.yaml.phase1, so an edit there can never look like it took effect.
+//
 // homed.yaml is edited in place: Update rewrites only the top-level sections that changed, so comments and the order
-// of untouched sections survive a `homed key new` or `homed relay connect`.
+// of untouched sections survive a `homed relay connect`.
 package config
 
 import (
@@ -26,8 +31,6 @@ import (
 
 	"go.yaml.in/yaml/v3"
 
-	"github.com/devXpro/gpt-home/internal/hub"
-	"github.com/devXpro/gpt-home/internal/keys"
 	"github.com/devXpro/gpt-home/internal/relay"
 )
 
@@ -37,7 +40,12 @@ const (
 	RelayTokenFile = "relay-token"
 	InstanceIDFile = "instance-id"
 	SocketFile     = "homed.sock"
-	AuditDir       = "audit"
+	// DBFile is the SQLite database (phase 2): people, passkeys, sessions, keys, plugins, audit and settings.
+	DBFile = "homed.db"
+	// Phase1Backup receives the phase 1 sections of homed.yaml once they are imported (ArchivePhase1).
+	Phase1Backup = FileName + ".phase1"
+	// AuditDir held the phase 1 audit log (JSON lines); phase 2 writes the audit to DBFile.
+	AuditDir = "audit"
 	// InstanceLockFile is flocked by the running homed for its whole life (LockInstance).
 	InstanceLockFile = ".homed.lock"
 	lockFile         = ".homed.yaml.lock"
@@ -48,9 +56,14 @@ const DefaultListen = "127.0.0.1:8080"
 
 // Config is homed.yaml.
 type Config struct {
+	Listen string `yaml:"listen,omitempty"`
+	// SetupListen is the first-run page's address on the home network; empty means firstrun.DefaultListen
+	// (0.0.0.0:8090). The page runs only until the home has an owner with a passkey.
+	SetupListen string `yaml:"setup_listen,omitempty"`
+	Relay       Relay  `yaml:"relay,omitempty"`
+
+	// The phase 1 sections: read once by the import into homed.db, then moved out by ArchivePhase1.
 	HomeName string   `yaml:"home_name,omitempty"`
-	Listen   string   `yaml:"listen,omitempty"`
-	Relay    Relay    `yaml:"relay,omitempty"`
 	Plugins  []Plugin `yaml:"plugins,omitempty"`
 	People   []Person `yaml:"people,omitempty"`
 }
@@ -115,22 +128,20 @@ func (c *Config) Plugin(id string) *Plugin {
 	return nil
 }
 
-// KeyEntries returns every stored key with its person, for keys.Resolver.
-func (c *Config) KeyEntries() []keys.Entry {
-	var out []keys.Entry
-	for _, p := range c.People {
-		person := hub.Person{ID: p.ID, Name: p.Name, Plugins: p.Plugins}
-		for _, k := range p.Keys {
-			out = append(out, keys.Entry{Person: person, SHA256: k.SHA256})
-		}
-	}
-	return out
+// HasPhase1 reports whether homed.yaml still has a phase 1 section: home_name, plugins or people.
+func (c *Config) HasPhase1() bool {
+	return c.HomeName != "" || len(c.Plugins) > 0 || len(c.People) > 0
 }
 
 // Validate checks the whole config.
 func (c *Config) Validate() error {
 	if c.Listen != "" {
 		if _, err := LoopbackPort(c.Listen); err != nil {
+			return err
+		}
+	}
+	if c.SetupListen != "" {
+		if err := checkSetupListen(c.SetupListen); err != nil {
 			return err
 		}
 	}
@@ -199,6 +210,19 @@ func LoopbackPort(addr string) (int, error) {
 		return 0, fmt.Errorf("listen %q: bad port", addr)
 	}
 	return port, nil
+}
+
+// checkSetupListen accepts "host:port" with any host (the first-run page is meant for the home network, so
+// 0.0.0.0 is the default) and a real port.
+func checkSetupListen(addr string) error {
+	_, p, err := net.SplitHostPort(addr)
+	if err != nil {
+		return fmt.Errorf("setup_listen %q: %w", addr, err)
+	}
+	if port, err := strconv.Atoi(p); err != nil || port <= 0 || port > 65535 {
+		return fmt.Errorf("setup_listen %q: bad port", addr)
+	}
+	return nil
 }
 
 // ResolveDataDir applies the flag value, then HOMED_DATA_DIR, then the platform default. A dir it has to create is
@@ -316,7 +340,52 @@ func Update(dir string, fn func(*Config) error) error {
 		return err
 	}
 	defer unlock()
+	return updateLocked(dir, fn)
+}
 
+// ArchivePhase1 moves the phase 1 sections (home_name, plugins, people) out of homed.yaml once the import has copied
+// them into homed.db. The file as it was goes to homed.yaml.phase1 (0600; when that exists, a name with the time
+// appended, so no earlier backup is overwritten), then homed.yaml is rewritten without those sections; the rest and
+// its comments stay. It returns the backup's path, or "" when there was nothing to move.
+func ArchivePhase1(dir string) (string, error) {
+	unlock, err := lock(dir)
+	if err != nil {
+		return "", err
+	}
+	defer unlock()
+	raw, err := readConfig(dir)
+	if err != nil {
+		return "", err
+	}
+	c, err := parse(raw)
+	if err != nil {
+		return "", err
+	}
+	if !c.HasPhase1() {
+		return "", nil
+	}
+	backup := filepath.Join(dir, Phase1Backup)
+	switch _, err := os.Lstat(backup); {
+	case err == nil:
+		backup += "." + time.Now().UTC().Format("20060102T150405.000Z")
+	case !errors.Is(err, fs.ErrNotExist):
+		return "", err
+	}
+	if err := WriteFileAtomic(backup, raw, 0o600); err != nil {
+		return "", fmt.Errorf("back up %s: %w", FileName, err)
+	}
+	err = updateLocked(dir, func(c *Config) error {
+		c.HomeName, c.Plugins, c.People = "", nil, nil
+		return nil
+	})
+	if err != nil {
+		return "", err
+	}
+	return backup, nil
+}
+
+// updateLocked is Update without taking the lock.
+func updateLocked(dir string, fn func(*Config) error) error {
 	raw, err := readConfig(dir)
 	if err != nil {
 		return err

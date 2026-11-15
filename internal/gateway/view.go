@@ -21,6 +21,7 @@ import (
 type snapshot struct {
 	changed      <-chan struct{}
 	tools        []hub.Tool
+	homeName     string // the MCP title; SetHomeName drops the snapshot
 	instructions string
 
 	mu    sync.Mutex
@@ -71,7 +72,9 @@ func (g *gateway) current() *snapshot {
 		}
 		tools = append(tools, t)
 	}
-	g.snap = &snapshot{changed: changed, tools: tools, instructions: g.instructions(), views: map[string]*view{}}
+	g.snap = &snapshot{
+		changed: changed, tools: tools, homeName: g.opts.HomeName, instructions: g.instructions(), views: map[string]*view{},
+	}
 	return g.snap
 }
 
@@ -132,7 +135,7 @@ func present(raw json.RawMessage) json.RawMessage {
 	return raw
 }
 
-// instructions is the hub preamble plus the plugins' own instructions (§5.4).
+// instructions is the hub preamble plus the plugins' own instructions (§5.4). g.mu is held.
 func (g *gateway) instructions() string {
 	home := "the user's home"
 	if g.opts.HomeName != "" {
@@ -196,7 +199,7 @@ func (g *gateway) buildView(s *snapshot, scope string) *view {
 	v.manifest, _ = marshal(m)
 
 	v.server = mcp.NewServer(
-		&mcp.Implementation{Name: "gpt-home", Title: g.opts.HomeName, Version: v.version},
+		&mcp.Implementation{Name: "gpt-home", Title: s.homeName, Version: v.version},
 		&mcp.ServerOptions{
 			Instructions: s.instructions,
 			Capabilities: &mcp.ServerCapabilities{Tools: &mcp.ToolCapabilities{}}, // stateless: no list_changed
