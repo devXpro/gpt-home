@@ -199,10 +199,14 @@ Every object below is the exact JSON shape; `?` marks an optional (omitted when 
 ```json
 {"id":"c_9fQ…","tool":"tv_pair","pluginId":"tv","title":"Pair a TV","args":{"tv":"tv"},
  "state":"running","startedAt":"…","endedAt?":"…","durationMs?":41234,"timeoutMs":180000,
- "progress?":{"progress":1,"total?":2,"message?":"Press OK on the TV remote"},
+ "progress?":{"progress":1,"total?":2,"message?":"Press OK on the TV remote",
+              "messageI18n?":{"ru":"Нажмите OK на пульте телевизора"}},
  "result?":{"text":"Living room TV is paired.","structured?":{…}},
  "error?":{"code":"timeout","message":"the tool did not answer within 180 s"}}
 ```
+- `progress.messageI18n` (added in T2.3/T2.7): translations of `message` by language; the UI shows its language and
+  falls back to `message`. Tool objects likewise carry `i18n?: {"<lang>": {"title","description","properties":{…}}}`
+  from the plugin's `_meta "gpt-home/i18n"` (admin API only; never sent to assistants).
 - `state`: `running`; `ok` (ran, `result` set); `failed` (ran and reported `isError`; `result.text` is the plugin's
   own text); `error` (could not run: `error.code` ∈ `plugin_unavailable|timeout|unknown_tool|internal`);
   `cancelled`.

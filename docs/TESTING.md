@@ -189,3 +189,21 @@ go test -race ./internal/install/...
 ```
 
 - The plugin host tests also cover translated tool texts and progress (`TestToolI18n`, `TestCallProgress`, `TestParseI18n`, `TestDeliverProgress`; T2.7).
+
+### Admin API backend (`internal/admin`)
+
+Runs the admin JSON API (T2.3) on `httptest` servers for the web and the socket handler, with in-memory fakes of the
+store, the plugin host, auth (cookie → principal), the relay, the installer and the key resolver; no network, no
+Docker. Covers the error shape and common headers, JSON 404/405, auth levels (public, session, owner, member 403, socket
+principal), the CSRF rule (header, Origin, Sec-Fetch-Site; socket exempt), content type and size limits, step-up
+(missing, expired, per session; socket exempt), key create/revoke with the resolver updated before the answer and no
+secret in lists or audit, passkeys and sessions of "me", tools/plugins/inventory cache/logs, admin tool calls (schema
+validation into `fields`, 409 `call_running`, progress with `message_i18n`, `wait=1`, cancel, audit with redaction),
+audit paging with filter-bound cursors, relay state and the domain-change rule, jobs (409 `job_running`, step reports,
+coded failures), and SSE (hello, replay after `Last-Event-ID`, `resync` for another run or an id that left the
+500-event ring, member filtering, `plugin.log`, `plugin`, `tools`, `audit`, `session.revoked` on revoke and on expiry).
+About 2 s.
+
+```sh
+go test -race ./internal/admin/...
+```
