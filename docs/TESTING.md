@@ -329,3 +329,43 @@ LAN first-run API and a fake gpt-tv with progress); scenarios are picked with `?
 Manual: `npm --prefix web run dev:mock` serves the mock app at http://localhost:5173/admin/ (`/firstrun` for the LAN
 page, PIN 1234 5678); `npm --prefix web run dev` proxies `/api` to a homed on 127.0.0.1:8080 started with
 `--dev-origin http://localhost:5173`.
+
+### Home installers (`install/test/`)
+
+```sh
+install/test/run.sh            # lint + mac + linux (all)
+install/test/run.sh lint       # shellcheck of home.sh, the wrapper and the tests
+install/test/run.sh mac        # macOS, temp HOME
+install/test/run.sh linux      # Docker: Debian containers gpthome-t41-*
+PLATFORMS="linux/amd64" SYSTEMD_PLATFORMS="" KEEP_IMAGES=1 install/test/run.sh linux
+```
+
+- `fakerelease.py` (stdlib only, run from a venv the script makes in a temp dir): a fake GitHub release server with the
+  real shapes (`/latest` redirect, `/download/<tag>/...`, `/raw/<ref>/install/...`) and releases v0.0.1 (flat),
+  v0.0.2, v0.0.3 (wrapped archives), v0.0.4 (checksum mismatch), v0.0.5 (archive with a `../evil` entry), v0.0.6
+  (linux arm64 only). The "homed" in the archives is a shell script (`version`, `run`, `admin firstrun`, `env`).
+- mac: `--no-start` in a temp HOME with a `launchctl` shim that fails the test on any call (files, modes,
+  `plutil -lint`, every plist key, re-run no-op, update, `.prev`, refusals, wrapped archive, `--prefix` with a space,
+  uninstall, `--purge`; the real LaunchAgent's checksum and pid are compared before and after), then the fake homed
+  under real launchd with the TEST label `com.github.devxpro.gpt-home.homed.t41` in a temp HOME, never the real label:
+  first-run output, re-run no-op, update restart, exit 75 restart, uninstall.
+- linux: `Dockerfile.linux` (Debian bookworm; target `base`, target `systemd` with systemd as PID 1) on every platform
+  in `PLATFORMS` (default native + amd64; arm/v7 is opt-in, its image takes 30+ minutes under qemu): `--no-start` flows
+  (user, modes, owners, unit content, `systemd-analyze verify`, the wrapper as root / as gpt-home / as an unprivileged
+  user with and without sudo rights, idempotent re-run, update, refusals, a foreign file at the command path, files
+  the service user plants in its program dir (a swapped binary, a `homed.prev` symlink) never run or written as root,
+  curl | bash with templates from the raw URL, `--prefix` with a space, uninstall, purge, not-root refusal) and, on
+  `SYSTEMD_PLATFORMS`, a real start, process owner, loaded hardening, UDP broadcast and multicast join from inside
+  the sandbox, restart after exit 75, no-op re-run keeps the PID, update, uninstall.
+
+### Plugin template (`templates/plugin`)
+
+A module of its own (`replace github.com/devXpro/gpt-home => ../..`), so `./...` of the repository does not include it:
+
+```sh
+go -C templates/plugin test -race ./...
+env -C templates/plugin golangci-lint run ./...
+```
+
+The tests drive the plugin through an in-memory MCP client against a fake Shelly device: the inventory tool, a switch
+with a device argument, an admin action with progress and its Russian texts.

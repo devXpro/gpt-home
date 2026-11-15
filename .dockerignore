@@ -1,0 +1,22 @@
+# Keeps the context of `docker build -f Dockerfile.dev .` small. GoReleaser builds the release image from its own
+# context (binaries, Dockerfile, LICENSE), so nothing here may hide those.
+.git
+.github
+bin
+/homed
+/data
+docs
+site
+relay
+install
+Formula
+**/node_modules
+web/test-results
+web/.mock-dist
+internal/web/dist
+**/*.db
+.env*
+*.token
+relay-token
+coverage.out
+.DS_Store

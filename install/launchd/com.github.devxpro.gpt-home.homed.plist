@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- GPT-Home hub (homed) LaunchAgent, written by install/home.sh to ~/Library/LaunchAgents/. The double-underscore words are
+     filled in by the installer; the installed copy is rewritten on every update. -->
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>__LABEL__</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>__HOMED_BIN__</string>
+		<string>run</string>
+	</array>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>HOMED_DATA_DIR</key>
+		<string>__DATA_DIR__</string>
+	</dict>
+	<key>RunAtLoad</key>
+	<true/>
+	<!-- Restarts homed after a crash and after a hub update from the admin (it exits with status 75 on purpose). -->
+	<key>KeepAlive</key>
+	<true/>
+	<key>ThrottleInterval</key>
+	<integer>10</integer>
+	<key>StandardOutPath</key>
+	<string>__LOG_FILE__</string>
+	<key>StandardErrorPath</key>
+	<string>__LOG_FILE__</string>
+</dict>
+</plist>
