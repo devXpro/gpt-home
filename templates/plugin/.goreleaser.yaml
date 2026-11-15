@@ -1,0 +1,50 @@
+# GoReleaser v2. `git tag v0.1.0 && git push --tags` runs .github/workflows/release.yml, which runs this.
+# The release must carry exactly what GPT-Home's installer looks for (docs/PLUGINS.md, "Release assets"):
+#   <binary>_<version>_<os>_<arch>.tar.gz   one archive per platform, version without the "v"
+#   checksums.txt                            "<sha256>  <archive name>" lines
+#   gpt-home-plugin.json                     the plugin manifest, uploaded as is
+version: 2
+
+project_name: gpt-plug
+
+before:
+  hooks:
+    - go mod tidy -diff
+    - go test ./...
+
+builds:
+  - id: gpt-plug
+    binary: gpt-plug
+    main: .
+    env:
+      - CGO_ENABLED=0
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w -X main.version={{ .Version }}
+    goos: [darwin, linux]
+    goarch: [amd64, arm64, arm]
+    goarm: ["7"]
+    ignore:
+      - goos: darwin
+        goarch: arm
+
+archives:
+  - id: default
+    formats: [tar.gz]
+    # gpt-plug_0.1.0_linux_arm64.tar.gz; 32-bit ARM becomes ..._linux_armv7.tar.gz
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}{{ with .Arm }}v{{ . }}{{ end }}"
+    files:
+      - README.md
+      - LICENSE*
+
+checksum:
+  name_template: checksums.txt
+  algorithm: sha256
+
+release:
+  extra_files:
+    - glob: ./gpt-home-plugin.json
+
+changelog:
+  sort: asc

@@ -1,0 +1,154 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="400" viewBox="0 0 1280 400" role="img" aria-labelledby="title desc">
+  <title id="title">GPT-Home</title>
+  <desc id="desc">GPT-Home: your home, by voice. ChatGPT talks to a self-hosted relay, the relay to the home hub, the hub to your devices.</desc>
+  <defs>
+    <radialGradient id="glowBlue" cx="0.12" cy="0" r="0.75">
+      <stop offset="0" stop-color="#0A84FF" stop-opacity="0.42"/>
+      <stop offset="1" stop-color="#0A84FF" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="glowGreen" cx="0.92" cy="1" r="0.6">
+      <stop offset="0" stop-color="#30D158" stop-opacity="0.20"/>
+      <stop offset="1" stop-color="#30D158" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="icon" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#3D9BFF"/>
+      <stop offset="1" stop-color="#5E5CE6"/>
+    </linearGradient>
+    <linearGradient id="sheen" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#FFFFFF" stop-opacity="0.22"/>
+      <stop offset="0.5" stop-color="#FFFFFF" stop-opacity="0"/>
+    </linearGradient>
+    <pattern id="dots" width="24" height="24" patternUnits="userSpaceOnUse">
+      <circle cx="2" cy="2" r="1" fill="#FFFFFF" fill-opacity="0.05"/>
+    </pattern>
+    <filter id="soft" x="-50%" y="-50%" width="200%" height="200%">
+      <feGaussianBlur stdDeviation="6"/>
+    </filter>
+    <clipPath id="frame"><rect width="1280" height="400" rx="28"/></clipPath>
+  </defs>
+  <style>
+    text { font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif; }
+    .mono { font-family: ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas, monospace; }
+    .bar { transform-box: fill-box; transform-origin: center; animation: talk 1.4s ease-in-out infinite; }
+    .b2 { animation-delay: -0.2s; } .b3 { animation-delay: -0.45s; } .b4 { animation-delay: -0.7s; } .b5 { animation-delay: -0.9s; }
+    @keyframes talk { 0%, 100% { transform: scaleY(0.45); } 50% { transform: scaleY(1); } }
+    @media (prefers-reduced-motion: reduce) { .bar { animation: none; } .pulse { display: none; } }
+  </style>
+
+  <g clip-path="url(#frame)">
+    <rect width="1280" height="400" fill="#000000"/>
+    <rect width="1280" height="400" fill="url(#glowBlue)"/>
+    <rect width="1280" height="400" fill="url(#glowGreen)"/>
+    <rect width="1280" height="400" fill="url(#dots)"/>
+  </g>
+  <rect x="0.5" y="0.5" width="1279" height="399" rx="27.5" fill="none" stroke="#FFFFFF" stroke-opacity="0.08"/>
+
+  <!-- App icon -->
+  <g transform="translate(80 92)">
+    <rect width="124" height="124" rx="30" fill="url(#icon)"/>
+    <rect width="124" height="124" rx="30" fill="url(#sheen)"/>
+    <g transform="translate(62 64) scale(1.75)" fill="none" stroke="#FFFFFF" stroke-width="3" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M-18 2 L0 -15 L18 2"/>
+      <path d="M-13 -3 V16 H13 V-3"/>
+      <path d="M-4 16 V7 H4 V16"/>
+    </g>
+  </g>
+
+  <!-- Wordmark -->
+  <text x="232" y="166" font-size="78" font-weight="700" letter-spacing="-2.5" fill="#FFFFFF">GPT-Home</text>
+  <text x="234" y="212" font-size="27" font-weight="500" fill="#EBEBF5" fill-opacity="0.62">Your home, by voice. Self-hosted.</text>
+
+  <!-- Chips -->
+  <g font-size="15" font-weight="600" fill="#EBEBF5" fill-opacity="0.86">
+    <g transform="translate(80 262)">
+      <rect width="158" height="36" rx="18" fill="#FFFFFF" fill-opacity="0.07" stroke="#FFFFFF" stroke-opacity="0.12"/>
+      <circle cx="18" cy="18" r="4.5" fill="#30D158" fill-opacity="1"/>
+      <text x="32" y="23">ChatGPT voice</text>
+    </g>
+    <g transform="translate(248 262)">
+      <rect width="160" height="36" rx="18" fill="#FFFFFF" fill-opacity="0.07" stroke="#FFFFFF" stroke-opacity="0.12"/>
+      <circle cx="18" cy="18" r="4.5" fill="#8E8E93" fill-opacity="1"/>
+      <text x="32" y="23">Your own relay</text>
+    </g>
+    <g transform="translate(418 262)">
+      <rect width="116" height="36" rx="18" fill="#FFFFFF" fill-opacity="0.07" stroke="#FFFFFF" stroke-opacity="0.12"/>
+      <circle cx="18" cy="18" r="4.5" fill="#0A84FF" fill-opacity="1"/>
+      <text x="32" y="23">Passkeys</text>
+    </g>
+    <g transform="translate(544 262)">
+      <rect width="108" height="36" rx="18" fill="#FFFFFF" fill-opacity="0.07" stroke="#FFFFFF" stroke-opacity="0.12"/>
+      <circle cx="18" cy="18" r="4.5" fill="#BF5AF2" fill-opacity="1"/>
+      <text x="32" y="23">Plugins</text>
+    </g>
+  </g>
+
+  <!-- Request path: ChatGPT → relay → homed → TV -->
+  <g stroke="#FFFFFF" stroke-opacity="0.22" stroke-width="2" stroke-linecap="round" stroke-dasharray="1 7" fill="none">
+    <path d="M782 196 H838"/>
+    <path d="M922 196 H978"/>
+    <path d="M1062 196 H1118"/>
+  </g>
+  <g class="mono" font-size="11.5" fill="#EBEBF5" fill-opacity="0.45" text-anchor="middle">
+    <text x="810" y="180">https</text>
+    <text x="950" y="180">wss·443</text>
+    <text x="1090" y="180">stdio</text>
+  </g>
+  <circle class="pulse" r="9" fill="#30D158" fill-opacity="0.55" filter="url(#soft)">
+    <animateMotion dur="3.2s" repeatCount="indefinite" path="M776 196 H1124" keyPoints="0;1;1" keyTimes="0;0.8;1" calcMode="linear"/>
+    <animate attributeName="opacity" dur="3.2s" repeatCount="indefinite" values="0;1;1;0;0" keyTimes="0;0.08;0.72;0.8;1"/>
+  </circle>
+  <circle class="pulse" r="3.5" fill="#FFFFFF">
+    <animateMotion dur="3.2s" repeatCount="indefinite" path="M776 196 H1124" keyPoints="0;1;1" keyTimes="0;0.8;1" calcMode="linear"/>
+    <animate attributeName="opacity" dur="3.2s" repeatCount="indefinite" values="0;1;1;0;0" keyTimes="0;0.08;0.72;0.8;1"/>
+  </circle>
+
+  <!-- ChatGPT voice -->
+  <g transform="translate(740 196)">
+    <rect x="-36" y="-36" width="72" height="72" rx="20" fill="#30D158"/>
+    <rect x="-36" y="-36" width="72" height="72" rx="20" fill="url(#sheen)"/>
+    <g fill="#FFFFFF">
+      <rect class="bar b1" x="-17" y="-7" width="5" height="14" rx="2.5"/>
+      <rect class="bar b2" x="-9" y="-13" width="5" height="26" rx="2.5"/>
+      <rect class="bar b3" x="-1" y="-18" width="5" height="36" rx="2.5"/>
+      <rect class="bar b4" x="7" y="-12" width="5" height="24" rx="2.5"/>
+      <rect class="bar b5" x="15" y="-6" width="5" height="12" rx="2.5"/>
+    </g>
+  </g>
+  <!-- Relay -->
+  <g transform="translate(880 196)">
+    <rect x="-36" y="-36" width="72" height="72" rx="20" fill="#3A3A3C"/>
+    <rect x="-36" y="-36" width="72" height="72" rx="20" fill="url(#sheen)"/>
+    <g fill="none" stroke="#FFFFFF" stroke-width="2.6" stroke-linejoin="round">
+      <rect x="-17" y="-15" width="34" height="12" rx="3"/>
+      <rect x="-17" y="3" width="34" height="12" rx="3"/>
+    </g>
+    <circle cx="-10" cy="-9" r="1.8" fill="#FFFFFF"/>
+    <circle cx="-10" cy="9" r="1.8" fill="#FFFFFF"/>
+  </g>
+  <!-- Home hub -->
+  <g transform="translate(1020 196)">
+    <rect x="-36" y="-36" width="72" height="72" rx="20" fill="#0A84FF"/>
+    <rect x="-36" y="-36" width="72" height="72" rx="20" fill="url(#sheen)"/>
+    <g fill="none" stroke="#FFFFFF" stroke-width="2.8" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M-18 2 L0 -15 L18 2"/>
+      <path d="M-13 -3 V16 H13 V-3"/>
+      <path d="M-4 16 V7 H4 V16"/>
+    </g>
+  </g>
+  <!-- TV -->
+  <g transform="translate(1160 196)">
+    <rect x="-36" y="-36" width="72" height="72" rx="20" fill="#5E5CE6"/>
+    <rect x="-36" y="-36" width="72" height="72" rx="20" fill="url(#sheen)"/>
+    <g fill="none" stroke="#FFFFFF" stroke-width="2.8" stroke-linecap="round" stroke-linejoin="round">
+      <rect x="-19" y="-9" width="38" height="26" rx="4"/>
+      <path d="M-7 -18 L0 -10 L7 -18"/>
+    </g>
+  </g>
+
+  <g font-size="15" font-weight="500" fill="#EBEBF5" fill-opacity="0.62" text-anchor="middle">
+    <text x="740" y="262">ChatGPT</text>
+    <text x="880" y="262">Relay</text>
+    <text x="1020" y="262">homed</text>
+    <text x="1160" y="262">Devices</text>
+  </g>
+</svg>

@@ -1,0 +1,26 @@
+// Replace github.com/your-name/gpt-plug with your own module path (your repository), e.g. github.com/alice/gpt-lamp.
+module github.com/your-name/gpt-plug
+
+go 1.26.0
+
+toolchain go1.26.11
+
+// For building inside the gpt-home repository only. In your own repository delete this line, then run
+//   go get github.com/devXpro/gpt-home@latest && go mod tidy
+replace github.com/devXpro/gpt-home => ../..
+
+require (
+	github.com/devXpro/gpt-home v0.0.0-00010101000000-000000000000
+	github.com/modelcontextprotocol/go-sdk v1.8.0
+)
+
+require (
+	github.com/google/jsonschema-go v0.4.3 // indirect
+	github.com/segmentio/asm v1.1.3 // indirect
+	github.com/segmentio/encoding v0.5.4 // indirect
+	github.com/yosida95/uritemplate/v3 v3.0.2 // indirect
+	golang.org/x/oauth2 v0.37.0 // indirect
+	golang.org/x/sync v0.24.0 // indirect
+	golang.org/x/sys v0.49.0 // indirect
+	golang.org/x/time v0.16.0 // indirect
+)
