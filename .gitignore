@@ -1,0 +1,12 @@
+/bin/
+/dist/
+node_modules/
+/internal/web/dist/*
+!/internal/web/dist/.gitkeep
+*.db
+/data/
+.env*
+*token*
+coverage.out
+site/.openai/hosting.json
+.DS_Store

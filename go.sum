@@ -1,0 +1,6 @@
+github.com/fatedier/frp v0.72.0 h1:BP0T6a0gdCqQoFP3iKngQMUtiTcHwvEGKtTb+uNYvaA=
+github.com/fatedier/frp v0.72.0/go.mod h1:d0piT5CR3u0FjOsQZPGKoGn5MLLEoEBa0AjHMKlM/Ps=
+github.com/modelcontextprotocol/go-sdk v1.8.0 h1:KIvahhYqwtbeniWVPs3TcXEA7b8jEtwfBpOTAI+Urx4=
+github.com/modelcontextprotocol/go-sdk v1.8.0/go.mod h1:dL7u98E/zjJTGzEq+j30jQ8K2k1mb6LeAH4inEcSGts=
+go.yaml.in/yaml/v3 v3.0.6 h1:zcDfvjXEqTQmpjniUBLc91xYJMB2c4QOFxEF/LCEckM=
+go.yaml.in/yaml/v3 v3.0.6/go.mod h1:HVTZu1O7/Vkt2N+BFy8Zza+lnLsABggaTM2ZpNIGuKg=
