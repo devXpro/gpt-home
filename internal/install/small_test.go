@@ -41,6 +41,9 @@ func TestParseManifest(t *testing.T) {
 	if m.Title != "tv" || len(m.Args) != 1 || m.Args[0] != "serve" || m.MinHubVersion != "0.2.0" {
 		t.Fatalf("defaults: %+v", m)
 	}
+	if _, err := ParseManifest([]byte(" {\"id\":\"tv\",\"binary\":\"x\"}\n\t ")); err != nil {
+		t.Fatalf("white space around the object: %v", err)
+	}
 	for name, body := range map[string]string{
 		"not json":    `nope`,
 		"bad id":      `{"id":"TV","binary":"x"}`,
@@ -49,6 +52,9 @@ func TestParseManifest(t *testing.T) {
 		"path binary": `{"id":"tv","binary":"bin/x"}`,
 		"dotdot":      `{"id":"tv","binary":".."}`,
 		"bad min":     `{"id":"tv","binary":"x","minHubVersion":"soon"}`,
+		"second json": `{"id":"tv","binary":"x"}{"id":"evil","binary":"y"}`,
+		"trailing":    `{"id":"tv","binary":"x"} trailing`,
+		"stray brace": `{"id":"tv","binary":"x"}}`,
 	} {
 		if _, err := ParseManifest([]byte(body)); !errors.Is(err, ErrBadManifest) {
 			t.Errorf("%s: err = %v", name, err)

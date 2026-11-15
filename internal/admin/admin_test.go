@@ -7,7 +7,9 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -59,7 +61,7 @@ func newEnv(t *testing.T, mods ...func(*Options)) *env {
 		t: t, st: st, host: newFakeHost(), auth: auth,
 		relay: &fakeRelay{domain: "homie.example"},
 		inst:  &fakeInstaller{release: make(chan struct{}), st: st},
-		keys:  &fakeKeys{},
+		keys:  &fakeKeys{st: st},
 	}
 	e.aw = NewAuditWriter(st.Audit(), st.People(), nil)
 	opts := Options{
@@ -645,6 +647,189 @@ func TestJobs(t *testing.T) {
 	r = e.do(call{method: "POST", path: "/plugins", local: true, body: `{"source":"local","id":"lamp","command":["/opt/lamp","serve"]}`})
 	if expect(t, r, 201, ""); r.body["source"].(map[string]any)["kind"] != "local" {
 		t.Fatalf("local add = %s", r.raw)
+	}
+}
+
+// Passkeys of an old relay domain open nothing: they do not count for ownerReady or as the last passkey (review L4).
+func TestPasskeysOfAnotherDomain(t *testing.T) {
+	var mu sync.Mutex
+	stale := map[string]bool{"pk1": true}
+	e := newEnv(t, func(o *Options) {
+		o.UsablePasskey = func(pk store.Passkey) bool {
+			mu.Lock()
+			defer mu.Unlock()
+			return !stale[pk.ID]
+		}
+	})
+	e.stepUp("tok-roman2") // the session of pk2
+	// pk2 is Roman's only passkey of the current domain: it stays, though the store holds two.
+	expect(t, e.do(call{method: "DELETE", path: "/me/passkeys/pk2", tok: "tok-roman2"}), 409, "last_passkey")
+	// The old domain's pk1 can go.
+	expect(t, e.do(call{method: "DELETE", path: "/me/passkeys/pk1", tok: "tok-roman2"}), 204, "")
+	if r := e.do(call{method: "GET", path: "/bootstrap"}); r.body["ownerReady"] != true {
+		t.Fatalf("bootstrap = %s", r.raw)
+	}
+	// With every passkey of the owner from another domain, the home has no owner who can sign in.
+	mu.Lock()
+	stale["pk2"] = true
+	mu.Unlock()
+	if r := e.do(call{method: "GET", path: "/bootstrap"}); r.body["ownerReady"] != false {
+		t.Fatalf("bootstrap with stale passkeys = %s", r.raw)
+	}
+}
+
+// Names follow the registration's rule everywhere, and PATCH /me is audited (review L7, L3).
+func TestNamesAndPatchMe(t *testing.T) {
+	e := newEnv(t)
+	for _, bad := range []string{`say "hi"`, "line\nbreak", `back\slash`, "tick`", "rtl\u202eover", "a\u2028b"} {
+		name, _ := json.Marshal(bad)
+		for _, c := range []call{
+			{method: "PATCH", path: "/me", tok: "tok-roman", body: `{"name":` + string(name) + `}`},
+			{method: "PATCH", path: "/settings", tok: "tok-roman", body: `{"homeName":` + string(name) + `}`},
+			{method: "PATCH", path: "/me/passkeys/pk1", tok: "tok-roman", body: `{"name":` + string(name) + `}`},
+		} {
+			if r := e.do(c); r.status != 400 || r.errCode() != "invalid_args" {
+				t.Errorf("%s %s %q: %d %s", c.method, c.path, bad, r.status, r.raw)
+			}
+		}
+	}
+	r := e.do(call{method: "PATCH", path: "/me", tok: "tok-roman", body: `{"name":"«Роман»","language":"en"}`})
+	if expect(t, r, 200, ""); r.body["name"] != "«Роман»" {
+		t.Fatalf("patch = %s", r.raw)
+	}
+	expect(t, e.do(call{method: "PATCH", path: "/me", tok: "tok-roman", body: `{"language":"en"}`}), 200, "") // no change
+	waitUntil(t, "person.update audit", func() bool {
+		var n int
+		for _, rec := range e.st.auditRecords() {
+			if rec.Action == "person.update" {
+				n++
+				if rec.Target != "roman" || rec.Via != "admin" || !strings.Contains(string(rec.Args), `"changed":["name","language"]`) {
+					t.Fatalf("audit %+v %s", rec, rec.Args)
+				}
+			}
+		}
+		return n == 1
+	})
+	if _, rebuilds := e.keys.snapshot(); rebuilds != 1 {
+		t.Fatalf("%d key rebuilds, want 1 (only the real change)", rebuilds)
+	}
+}
+
+// The audit of an admin tool call keeps the gateway's text for a validation failure, which may quote the redacted
+// arguments; the caller still sees the plugin's own words (review L3).
+func TestToolCallAuditText(t *testing.T) {
+	e := newEnv(t)
+	gate := e.host.gate("tv_volume")
+	r := e.do(call{method: "POST", path: "/tools/tv_volume/calls", tok: "tok-roman", body: `{"args":{"tv":"tv","percent":5}}`})
+	expect(t, r, 202, "")
+	id := r.body["id"].(string)
+	gate <- hub.Result{IsError: true, Text: `validating "arguments": pin: "4711" does not match`}
+	waitUntil(t, "call end", func() bool {
+		return e.do(call{method: "GET", path: "/calls/" + id, tok: "tok-roman"}).body["state"] == "failed"
+	})
+	if r := e.do(call{method: "GET", path: "/calls/" + id, tok: "tok-roman"}); !strings.Contains(r.raw, "4711") {
+		t.Fatalf("the caller lost the plugin's text: %s", r.raw)
+	}
+	waitUntil(t, "tool audit", func() bool {
+		for _, rec := range e.st.auditRecords() {
+			if rec.Kind == store.AuditTool && rec.Tool == "tv_volume" {
+				if strings.Contains(rec.Error, "4711") || !strings.HasPrefix(rec.Error, "invalid arguments") {
+					t.Fatalf("audit error %q", rec.Error)
+				}
+				return true
+			}
+		}
+		return false
+	})
+}
+
+// Downgrades of the hub and of plugins happen only on the socket, with the explicit flag (review L5).
+func TestDowngradeOnlyOnTheSocket(t *testing.T) {
+	e := newEnv(t)
+	e.stepUp("tok-roman")
+	// The web never downgrades: an older version is refused at once, and so is the flag itself.
+	for _, c := range []struct{ path, body, code string }{
+		{"/plugins/tv/update", `{"version":"0.1.0"}`, "downgrade"},
+		{"/plugins/tv/update", `{"version":"v0.1.9"}`, "downgrade"},
+		{"/plugins/tv/update", `{"version":"0.1.0","allowDowngrade":true}`, "forbidden"},
+		{"/plugins/tv/update", `{"allowDowngrade":true}`, "forbidden"},
+		{"/system/update", `{"version":"0.1.0"}`, "downgrade"},
+		{"/system/update", `{"allowDowngrade":true}`, "forbidden"},
+	} {
+		r := e.do(call{method: "POST", path: c.path, tok: "tok-roman", body: c.body})
+		if r.errCode() != c.code {
+			t.Errorf("%s %s: %d %s", c.path, c.body, r.status, r.raw)
+		}
+	}
+	// The socket needs the flag too.
+	expect(t, e.do(call{method: "POST", path: "/plugins/tv/update", local: true, body: `{"version":"0.1.0"}`}), 409, "downgrade")
+	r := e.do(call{method: "POST", path: "/plugins/tv/update", local: true, body: `{"version":"0.1.0","allowDowngrade":true}`})
+	expect(t, r, 202, "")
+	jobDone(t, e, r.body["id"].(string))
+	r = e.do(call{method: "POST", path: "/system/update", local: true, body: `{"version":"0.1.0","allowDowngrade":true}`})
+	expect(t, r, 202, "")
+	jobDone(t, e, r.body["id"].(string))
+	// A web update of the latest release reaches the installer with the downgrade refused (it checks "latest").
+	r = e.do(call{method: "POST", path: "/plugins/tv/update", tok: "tok-roman", body: `{}`})
+	expect(t, r, 202, "")
+	jobDone(t, e, r.body["id"].(string))
+	if got := e.inst.allowed(); !slices.Equal(got, []bool{true, true, false}) {
+		t.Fatalf("allowDowngrade passed to the installer: %v", got)
+	}
+}
+
+// One job at a time per plugin, whatever its kind (review L9).
+func TestOneJobPerPlugin(t *testing.T) {
+	e := newEnv(t)
+	e.stepUp("tok-roman")
+	e.inst.mu.Lock()
+	e.inst.blockUpdates = true
+	e.inst.mu.Unlock()
+	r := e.do(call{method: "POST", path: "/plugins/tv/update", tok: "tok-roman", body: `{}`})
+	expect(t, r, 202, "")
+	id := r.body["id"].(string)
+	r = e.do(call{method: "DELETE", path: "/plugins/tv", tok: "tok-roman"})
+	expect(t, r, 409, "job_running")
+	if r.body["error"].(map[string]any)["jobId"] != id {
+		t.Fatalf("409 = %s", r.raw)
+	}
+	e.inst.release <- struct{}{}
+	jobDone(t, e, id)
+	expect(t, e.do(call{method: "DELETE", path: "/plugins/tv", tok: "tok-roman"}), 202, "")
+}
+
+// jobDone waits until the job ends and checks that it succeeded.
+func jobDone(t *testing.T, e *env, id string) {
+	t.Helper()
+	waitUntil(t, "job "+id, func() bool {
+		return e.do(call{method: "GET", path: "/jobs/" + id, tok: "tok-roman"}).body["state"] != "running"
+	})
+	if r := e.do(call{method: "GET", path: "/jobs/" + id, tok: "tok-roman"}); r.body["state"] != "ok" {
+		t.Fatalf("job %s: %s", id, r.raw)
+	}
+}
+
+// The preview shows a manifest homepage only when it is a plain https link (review L6).
+func TestPreviewHomepage(t *testing.T) {
+	e := newEnv(t)
+	for _, c := range []struct{ homepage, want string }{
+		{"https://example.com/gpt-tv", "https://example.com/gpt-tv"},
+		{" https://example.com/x ", "https://example.com/x"},
+		{"http://example.com", ""},
+		{"javascript:alert(document.domain)", ""},
+		{"https://user:pw@example.com", ""},
+		{"//example.com", ""},
+		{"https:example.com", ""},
+		{"", ""},
+	} {
+		e.inst.mu.Lock()
+		e.inst.homepage = c.homepage
+		e.inst.mu.Unlock()
+		r := e.do(call{method: "GET", path: "/plugins/preview?repo=devXpro/gpt-tv", tok: "tok-roman"})
+		got, _ := r.body["homepage"].(string)
+		if expect(t, r, 200, ""); got != c.want {
+			t.Errorf("homepage %q → %q, want %q", c.homepage, got, c.want)
+		}
 	}
 }
 

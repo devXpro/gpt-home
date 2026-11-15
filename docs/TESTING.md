@@ -11,7 +11,13 @@ Every suite is listed here with the exact command to run it. Each task appends i
 ```sh
 make lint   # golangci-lint run ./...
 make test   # go test -race ./...
+make vuln   # govulncheck v1.9.0 on the go.mod toolchain (go1.26.11): no known vulnerability reachable from the code
 ```
+
+`go.mod` pins the toolchain (`toolchain go1.26.11`), so the `go` command fetches that patch release whatever Go is
+installed; `go -C <repo> version` shows it. Run govulncheck from inside the module (`make vuln`, or `go -C <repo> run
+golang.org/x/vuln/cmd/govulncheck@v1.9.0 ./...`): it reads `go env GOVERSION` from its working directory, so
+`govulncheck -C <repo>` started elsewhere checks the wrong standard library. CI has a `vuln` job in both repos.
 
 ## Integration tests
 
@@ -152,9 +158,9 @@ with `-race`:
 - `TestDaemon` is the acceptance: a phase 1 data dir (relay on a closed local port, the fake plugin, Roman with a key)
   starts as a phase 2 homed. The import into homed.db and the archived homed.yaml; Roman's old key on the REST façade
   (also with the relay's Host; a foreign Host gets 421); `/` → `/admin/`, the SPA (or its 503 hint before `make web`),
-  bootstrap and session; the CLI over the socket (`key list/new`, `tool list/call` as the owner via `cli`, a failing and
-  an unknown tool, `plugin list`, `relay status`); the first-run page (PIN from the terminal, cookie, `connecting`,
-  `relay_not_ready`); the owner's passkey from `homed admin setup-link`, registered with a virtual authenticator
+  bootstrap and session; the CLI over the socket (`key list/new`, `tool list/call` as the owner via `cli`, arguments
+  from stdin with `-`, a failing and an unknown tool, `plugin list`, `relay status`); the first-run page (the 8-digit
+  PIN from the terminal, cookie, `connecting`, `relay_not_ready`); the owner's passkey from `homed admin setup-link`, registered with a virtual authenticator
   (`descope/virtualwebauthn`) through the relay's origin; the new home name reaching the gateway at once and the
   first-run page answering 410; a key created in the admin, used, revoked; an admin tool call with progress released
   from the CLI; a rename of the home; the `echo` plugin added and removed while homed runs; a second homed refused; a
@@ -165,8 +171,15 @@ with `-race`:
   `TestRelayConfigErrorInStatus`.
 - `TestInstallerAdapter`: the admin's installer against an `httptest` TLS fake of GitHub with the real store and plugin
   host: install (steps, store row, plugin up), a second install of the same plugin refused before it touches the
-  files, an update whose binary does not start (rolled back to the old row and binary), a good update, remove, and the
-  hub update ending in a restart request.
+  files, an update whose binary does not start (rolled back to the old row and binary), a good update, a refused
+  downgrade, the per-plugin lock (install, update and remove answer `job_running`), remove, and the hub update ending
+  in a restart request.
+- T2.F security fixes (`security_test.go`): `TestKeyRebuildCannotResurrectARevokedKey` (a stalled SIGHUP rebuild and
+  a revoke's rebuild land in order), `TestPruneAudit` (180 days, at start), `TestFirstRunWithoutATerminal` (no PIN in
+  the log; `homed admin firstrun` shows the page, reopens it after it closed, refuses once the owner exists),
+  `TestFirstRunAddr` (0.0.0.0:8090 only without a relay), `TestTerminalOf`, `TestPublicServerTimeouts` (ReadTimeout cuts a
+  stalled body, never a long answer); `TestRelayConnectErrors` checks that a code on the command line is refused
+  without being echoed.
 - The CLI without a running homed (`TestOfflineCommands`: keys, plugins, `admin setup-link`/`reset-access`, through the
   in-process admin API), `TestPhase1Import` (Roman's homed.yaml shape), `relay connect` (stdin, comments kept, the
   domain-change hint, audit), `key new --keychain` against a fake `security` that must get the key on stdin and never in
@@ -181,8 +194,9 @@ go test -race ./cmd/homed/... ./internal/config/...
 Playwright against a **real** homed, nothing mocked. `global-setup.ts` builds homed (with the SPA that `make web`
 embedded) and the fake plugin into a fresh `/tmp/gh-e2e-*` dir, adds the plugin, and runs `homed run --dev-origin
 http://localhost:<port>` on a data dir there (127.0.0.1 only, free ports). One story, in Chromium with Chrome's
-virtual authenticator (real WebAuthn ceremonies): the LAN first-run page (the PIN homed printed, then the server code
-step, as there is no relay in development) → `homed admin setup-link` → the wizard and a passkey for `localhost` → the
+virtual authenticator (real WebAuthn ceremonies): the LAN first-run page (the PIN from `homed admin firstrun`, never in
+homed's log since it runs without a terminal; then the server code step, as there is no relay in development) →
+`homed admin setup-link` → the wizard and a passkey for `localhost` → the
 home → Устройства → Fake → a tool run from the admin with live progress, released by `homed tool call fake_release` →
 Настройки → Ключи доступа: a new key → `GET /api/v1/tools` and `POST /api/v1/tools/fake_echo` with it, as a Site would
 → the call in Журнал → revoke → the key gets 401. CSP violations and page errors fail it. About 15 s after the builds;
@@ -216,8 +230,10 @@ resolving (latest, by version, `v` and bare tags, prerelease and draft handling,
 choice by the GoReleaser name (incl. armv7), checksum verification (mismatch, missing file, missing line), the full
 install and update flows with their job steps, start failure with rollback, same-version replacement, pruning and
 removal, the size limits (advertised and streamed), https-only incl. a redirect to plain http, the token going only to
-the API host and never into errors, and the archive guard (`..`, absolute and backslash names, escaping symlinks, hard
-links, devices, duplicates, entry and size caps, a gzip bomb, mode normalization). The homed self-update replaces a
+the API host and never into errors, and the archive guard (`..`, absolute and backslash names, links of any kind incl.
+the chained-symlink escape of the T2 review, devices, duplicates, entry and size caps, a gzip bomb, mode
+normalization), the manifest written through `os.Root` (`TestWriteManifest`) and parsed strictly (no trailing data),
+and downgrades refused unless allowed (`TestUpdateRefusesDowngrade`, hub too). The homed self-update replaces a
 fake executable in a temp dir (swap, `.prev` backup, rollback, failing self-test, read-only directory, symlinked
 executable). About 2 s.
 
@@ -243,7 +259,11 @@ validation into `fields`, 409 `call_running`, progress with `message_i18n`, `wai
 audit paging with filter-bound cursors, relay state and the domain-change rule, jobs (409 `job_running`, step reports,
 coded failures), and SSE (hello, replay after `Last-Event-ID`, `resync` for another run or an id that left the
 500-event ring, member filtering, `plugin.log`, `plugin`, `tools`, `audit`, `session.revoked` on revoke and on expiry),
-and the CSRF origin read per request (`TestOriginFunc`, T2.6).
+and the CSRF origin read per request (`TestOriginFunc`, T2.6). T2.F adds: downgrades only on the socket with the
+flag (`TestDowngradeOnlyOnTheSocket`), one job per plugin (`TestOneJobPerPlugin`), the https-only preview homepage
+(`TestPreviewHomepage`), passkeys of another relay domain (`TestPasskeysOfAnotherDomain`), the shared name rule and
+the `person.update` audit of `PATCH /me` (`TestNamesAndPatchMe`), and the gateway's audit text for admin tool calls
+(`TestToolCallAuditText`).
 About 2 s.
 
 ```sh
@@ -262,13 +282,20 @@ finished at the wrong endpoint; setup tokens single use (also two registrations 
 and finish, with rollback), revoked by a newer link, unknown; step-up (5-minute window, renewal, another person's
 passkey, another session's ceremony), add passkey behind step-up (`excludeCredentials`, `passkey_exists`), clone
 detection by the sign counter, idle and absolute session expiry, touch throttling and event streams, the hourly sweep,
-the CSRF rule, request format errors, the rate limits (per client from the Caddy hop of `X-Forwarded-For`, in total,
-`Retry-After`), `homed admin setup-link` and `reset-access` over the local handler, and the name, slug, device-label
-and credential-storage helpers. `internal/firstrun`: the PIN gate (cookie only hashed, 30 minutes), five wrong PINs →
-a new PIN printed and the lock with `Retry-After`, the relay code step (bad codes, no token in errors, `Connect`),
-`relay_not_ready` until connected with a passing self-check, link → passkey registration end to end → every path
-`410 setup_done`, the Host guard against DNS rebinding, CSRF, routes, the SSE `relay` stream, and `Serve` printing
-the URL and PIN. About 3 s.
+the CSRF rule, request format errors, the rate limits per class (`TestRateLimitTokens`: per client from the Caddy hop
+of `X-Forwarded-For` and in total, no address = own bucket; `TestRateLimitLogin`: begins and failed finishes per
+address, no shared bucket; `TestRateLimitStepUpPerSession`: an anonymous flood never touches a session's step-up;
+`TestCeremonyPools`), the audit of failures with the client's address (`TestFailuresAreAudited`), `OwnerReady` by
+relying party, setup links with a TTL and a client (`TestSetupLinkTTLAndClient`), `homed admin setup-link` and
+`reset-access` over the local handler, and the name (incl. quotes, separators, bidi overrides), slug, device-label and
+credential-storage helpers. `internal/firstrun`: the PIN gate (8 digits, cookie only hashed, 30 minutes), five wrong
+PINs lock that device only (`TestPINLockoutPerClient`), 20 close the page for everybody with `410 setup_closed`
+(`TestPINFailureCapClosesThePage`, `TestServeClosesAfterTheCap`), the page closing after its time and the PIN
+changing on a timer and after every link (`TestServeClosesAndRotates`, `TestFirstRunEndToEnd`), no PIN without a
+terminal (`TestNoTerminalNoPIN`), the relay code step (bad codes, no token in errors, `Connect`, `409 conflict` once a
+relay exists, the client in the audit), `relay_not_ready` until connected with a passing self-check, 3-minute links →
+passkey registration end to end → every path `410 setup_done`, the Host guard against DNS rebinding, CSRF, routes, the
+SSE `relay` stream, and `Serve` printing the URL and PIN. About 3 s.
 
 ```sh
 go test -race ./internal/auth/... ./internal/firstrun/...
@@ -284,20 +311,21 @@ LAN first-run API and a fake gpt-tv with progress); scenarios are picked with `?
 - `npm --prefix web test` — Vitest (jsdom, about 1 s): the JSON Schema → form rules of DESIGN.md §9.3 (every control,
   ordering, labels from `i18n`, defaults, arguments, validation words, server `invalid_args`), the SchemaForm
   component (device picker with "Другое…", slider, segmented control with arrow keys, select, secret toggle, switch,
-  chips, checklist, JSON editor, nested object, folding), tool grouping (§9.2) and RU/EN key and placeholder parity.
+  chips, checklist, JSON editor, nested object, folding), tool grouping (§9.2), RU/EN key and placeholder parity, and
+  the https-only link of a plugin homepage (`lib/links.test.ts`).
 - `npm --prefix web run e2e` — Playwright smoke (Chromium, about 1 min). It builds the mock bundle and serves it with
   `vite preview` under the production CSP (`internal/web/csp.txt`); any CSP violation or page error fails a test.
   Sign-in and the first-run wizard use Chrome's virtual authenticator (real WebAuthn ceremonies); also an admin tool
   with progress (`tv_pair`), form validation and a failed run with retry, discovery → add from the result, step-up
-  before creating a key, the LAN page (PIN, lock after five wrong PINs, connecting, QR link), the offline home, a
-  destructive action's confirmation, no layout shift while navigating, and axe (WCAG 2.1 AA) on eight screens in
-  both themes.
+  before creating a key, the LAN page (8-digit PIN, this device waiting after five wrong PINs, connecting, QR link, the
+  closed page), the offline home, a destructive action's confirmation, no layout shift while navigating, and axe
+  (WCAG 2.1 AA) on eight screens in both themes.
 - `npm --prefix web run screenshots` — regenerates `docs/screenshots/*.webp` (git-ignored; a curated set is committed in `docs/images/`) (63 screens × dark/light ×
   phone 390×844 / desktop 1440×900, about 10 min). `-- --grep "phone dark"` narrows it.
 - `go test -race ./internal/web/...` — the Go handler: SPA fallback for client routes (`/admin/...`, `/firstrun`,
   `/join`), immutable hashed assets, 404 (not HTML) for missing assets, dotfiles never served, ETag/304, gzip and
-  `q=0`, HEAD, 405, the CSP and security headers, the 503 hint before `make web`, and the embedded build.
+  `q=0`, HEAD, 405, the CSP and security headers (HSTS included), the 503 hint before `make web`, and the embedded build.
 
 Manual: `npm --prefix web run dev:mock` serves the mock app at http://localhost:5173/admin/ (`/firstrun` for the LAN
-page, PIN 123456); `npm --prefix web run dev` proxies `/api` to a homed on 127.0.0.1:8080 started with
+page, PIN 1234 5678); `npm --prefix web run dev` proxies `/api` to a homed on 127.0.0.1:8080 started with
 `--dev-origin http://localhost:5173`.

@@ -18,7 +18,7 @@
 //
 //	cand, err := in.Resolve(ctx, "devXpro/gpt-tv", "latest")     // GET /plugins/preview: release, manifest, asset?, compatible?
 //	got, err  := in.Install(ctx, "devXpro/gpt-tv", "", "tv", h)  // POST /plugins           (job plugin.install)
-//	got, err  := in.Update(ctx, "tv", repo, current, "", h)      // POST /plugins/{id}/update (job plugin.update)
+//	got, err  := in.Update(ctx, "tv", repo, current, "", false, h) // POST /plugins/{id}/update (job plugin.update)
 //	err       := in.Remove("tv", keepData)                       // DELETE /plugins/{id}     (after the plugin stopped)
 //	got, err  := in.Locate("tv", "0.2.0")                        // read an installed version back, offline
 //	rel, err  := cl.Latest(ctx, repo)                            // check-updates: compare rel.Version with the store's
@@ -26,7 +26,9 @@
 // Install and Update run the job steps of ADMIN-API §3 and report each one through Hooks.Step: resolve, download,
 // verify, unpack, (update only) switch, start, and rollback when a start fails. Hooks.Progress carries archive
 // download bytes for the job's progress bar. Errors map to job error codes with Code(err): checksum_mismatch,
-// no_asset, incompatible, start_failed, rolled_back, upstream, internal, plus not_found and up_to_date.
+// no_asset, incompatible, start_failed, rolled_back, downgrade, upstream, internal, plus not_found and up_to_date. A
+// release older than the installed one (or the running hub) is ErrDowngrade unless the caller allows it; the admin
+// allows it only on the local socket with an explicit flag.
 //
 // Layout and atomicity. Files land in <data_dir>/plugins/<id>/bin/<version>/. A release is downloaded and unpacked in
 // a staging directory .stage-* under <data_dir>/plugins/ and appears with one rename, so a crash never leaves a
@@ -46,17 +48,17 @@
 // must equal its line in the release's checksums.txt before anything is unpacked (ErrChecksumMismatch, or
 // ErrNoChecksum when the file or line is missing). Note that checksums.txt comes from the same release, so this
 // guards against corruption and a bad mirror, not against a compromised repository; the trust anchor is the repo
-// the owner chose in the admin. Unpacking refuses absolute and ".." paths, backslashes, duplicate entries, hard
-// links, devices and FIFOs, and symlinks that are absolute or leave the target; every file operation goes through
-// os.Root, which independently refuses to leave the target directory. Downloads (256 MiB), unpacked bytes
-// (512 MiB, counted on real decompressed bytes) and entry counts (2000) are capped; see Limits. File modes are
-// normalized to 0755 or 0644, so setuid bits never survive.
+// the owner chose in the admin. Unpacking refuses absolute and ".." paths, backslashes, duplicate entries, links of
+// any kind (symbolic and hard), devices and FIFOs; every file operation goes through os.Root, which independently
+// refuses to leave the target directory, and the stored manifest is written through it too (O_EXCL, no link
+// followed). Downloads (256 MiB), unpacked bytes (512 MiB, counted on real decompressed bytes) and entry counts (2000)
+// are capped; see Limits. File modes are normalized to 0755 or 0644, so setuid bits never survive.
 //
 // # Self-update of homed
 //
 //	u := &install.HubUpdater{Client: cl, Version: hubVersion}
 //	rel, newer, err := u.Latest(ctx)             // POST /system/check-update
-//	res, err := u.Update(ctx, "", hooks)         // job hub.update: resolve, download, verify, replace
+//	res, err := u.Update(ctx, "", false, hooks)  // job hub.update: resolve, download, verify, replace
 //	// then: finish the job, shut down gracefully, os.Exit(install.ExitCodeRestart)
 //
 // Update downloads homed_<version>_<os>_<arch>.tar.gz, verifies it, unpacks it into a temporary directory, runs

@@ -1,6 +1,7 @@
 package auth
 
 import (
+	"errors"
 	"regexp"
 	"strings"
 	"testing"
@@ -8,6 +9,8 @@ import (
 
 	"github.com/go-webauthn/webauthn/protocol"
 	"github.com/go-webauthn/webauthn/webauthn"
+
+	"github.com/devXpro/gpt-home/internal/auth/wire"
 )
 
 func TestSlug(t *testing.T) {
@@ -36,9 +39,22 @@ func TestCheckName(t *testing.T) {
 	if got, err := checkName("/n", "  Мой шалаш \t"); err != nil || got != "Мой шалаш" {
 		t.Fatalf("%q %v", got, err)
 	}
-	for _, bad := range []string{"", " ", strings.Repeat("x", 41), "a\x00b", "line\nbreak"} {
-		if _, err := checkName("/n", bad); err == nil {
+	for _, good := range []string{"«Мой шалаш»", "Roman's home", "🏠 Дача 2", "Ю" + strings.Repeat("x", 39)} {
+		if got, err := checkName("/n", good); err != nil || got != good {
+			t.Errorf("%q: %q %v", good, got, err)
+		}
+	}
+	for _, bad := range []string{
+		"", " ", strings.Repeat("x", 41), "a\x00b", "line\nbreak", "cr\rhere", "tab\tinside", "nel\u0085here",
+		"line\u2028sep", "para\u2029sep", "rtl\u202eoverride", "isolate\u2066x", `say "hi"`, `back\slash`, "tick`",
+	} {
+		_, err := checkName("/n", bad)
+		if err == nil {
 			t.Errorf("%q accepted", bad)
+			continue
+		}
+		if we, ok := errors.AsType[*wire.Error](err); !ok || we.Code != "invalid_args" || we.Fields[0].Path != "/n" {
+			t.Errorf("%q: %v", bad, err)
 		}
 	}
 }
@@ -106,26 +122,10 @@ func TestLimiterPrune(t *testing.T) {
 	l := newLimiter(1, 1_000_000)
 	now := time.Date(2026, 11, 15, 12, 0, 0, 0, time.UTC)
 	for i := range maxBuckets + 10 {
-		l.allow(strings.Repeat("x", i%7)+time.Duration(i).String(), now)
+		l.take(strings.Repeat("x", i%7)+time.Duration(i).String(), now)
+		l.peek("p"+time.Duration(i).String(), now)
 	}
 	if len(l.buckets) > maxBuckets {
 		t.Fatalf("%d buckets", len(l.buckets))
-	}
-}
-
-func TestCeremoniesBounded(t *testing.T) {
-	cs := newCeremonies()
-	now := time.Date(2026, 11, 15, 12, 0, 0, 0, time.UTC)
-	for range maxCeremonies {
-		if _, ok := cs.add(&ceremony{kind: kindLogin, expires: now.Add(CeremonyTTL)}, now); !ok {
-			t.Fatal("refused below the bound")
-		}
-	}
-	if _, ok := cs.add(&ceremony{kind: kindLogin, expires: now.Add(CeremonyTTL)}, now); ok {
-		t.Fatal("accepted above the bound")
-	}
-	// Expired ones make room again.
-	if _, ok := cs.add(&ceremony{kind: kindLogin, expires: now.Add(2 * CeremonyTTL)}, now.Add(CeremonyTTL)); !ok {
-		t.Fatal("expired ceremonies kept")
 	}
 }

@@ -15,6 +15,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
+	"unicode/utf8"
 )
 
 // MaxBody caps request bodies (ADMIN-API §1.1).
@@ -53,6 +55,35 @@ func Invalid(path, code, message string) *Error {
 		Status: http.StatusBadRequest, Code: "invalid_args", Message: strings.TrimPrefix(path, "/") + ": " + message,
 		Fields: []Field{{Path: path, Code: code, Message: message}},
 	}
+}
+
+// MaxNameLen is the longest display name of a person, the home or a passkey (ADMIN-API §3.2), in characters.
+const MaxNameLen = 40
+
+// CheckName trims a display name (a person, the home, a passkey) and checks it: 1 to 40 characters, no control
+// characters, no line or paragraph separators, no bidirectional overrides, and no double quotes, backslashes or
+// backticks. Names reach the assistants' instructions and the MCP server's title, where a line break or a quote could
+// pass for an instruction of its own. The error is a 400 invalid_args *Error about path. internal/auth (registration,
+// passkey names) and internal/admin (PATCH /me, /settings, passkey renames) share this one rule.
+func CheckName(path, v string) (string, error) {
+	v = strings.TrimSpace(v)
+	if n := utf8.RuneCountInString(v); n < 1 || n > MaxNameLen {
+		return "", Invalid(path, "length", "must be 1 to 40 characters")
+	}
+	if strings.ContainsFunc(v, badNameRune) {
+		return "", Invalid(path, "pattern", "must not contain control characters, line breaks, quotes, backslashes or backticks")
+	}
+	return v, nil
+}
+
+func badNameRune(r rune) bool {
+	switch {
+	case unicode.IsControl(r), r == '\u2028', r == '\u2029', r == '"', r == '\\', r == '`':
+		return true
+	case r >= '\u202a' && r <= '\u202e', r >= '\u2066' && r <= '\u2069':
+		return true // bidirectional embeddings, overrides and isolates
+	}
+	return false
 }
 
 // Headers sets the headers every API answer carries: no caching, no sniffing and a request id (kept when an outer

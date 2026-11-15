@@ -78,25 +78,38 @@ func cmdToolList(args []string, stdout, stderr io.Writer) error {
 	return tw.Flush()
 }
 
+// maxToolArgs is the admin API's limit on tool arguments (ADMIN-API §1.1).
+const maxToolArgs = 64 << 10
+
 // cmdToolCall calls one tool through the running homed (the owner, via "cli"), prints its progress to stderr while it
-// runs, then its text and its structured result as indented JSON. A tool that reports a failure makes homed exit
-// with status 1.
-func cmdToolCall(args []string, stdout, stderr io.Writer) error {
+// runs, then its text and its structured result as indented JSON. The arguments are a JSON object on the command
+// line, or "-" to read them from stdin (for anything secret, like a pairing PIN, that must stay out of shell history
+// and the process list). A tool that reports a failure makes homed exit with status 1.
+func cmdToolCall(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
 	fl, dataDir := newFlags("tool call", stderr)
 	pos, err := parseFlags(fl, args)
 	if err != nil {
 		return err
 	}
 	if len(pos) < 1 || len(pos) > 2 {
-		return errors.New("usage: homed tool call <name> ['<json arguments>']")
+		return errors.New("usage: homed tool call <name> ['<json arguments>' | -]")
 	}
 	name, arguments := pos[0], json.RawMessage(`{}`)
 	if len(pos) == 2 {
+		raw := []byte(pos[1])
+		if pos[1] == "-" {
+			if raw, err = io.ReadAll(io.LimitReader(stdin, maxToolArgs+1)); err != nil {
+				return fmt.Errorf("read the arguments from stdin: %w", err)
+			}
+			if len(raw) > maxToolArgs {
+				return errors.New("the arguments on stdin are over 64 KiB")
+			}
+		}
 		var obj map[string]json.RawMessage
-		if err := json.Unmarshal([]byte(pos[1]), &obj); err != nil || obj == nil {
+		if err := json.Unmarshal(raw, &obj); err != nil || obj == nil {
 			return errors.New("the arguments must be a JSON object")
 		}
-		arguments = json.RawMessage(pos[1])
+		arguments = json.RawMessage(bytes.TrimSpace(raw))
 	}
 	dir, err := config.ResolveDataDir(*dataDir)
 	if err != nil {

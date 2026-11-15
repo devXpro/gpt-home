@@ -29,6 +29,7 @@ export const SCENARIOS = [
   'firstrun',
   'firstrun-norelay',
   'firstrun-done',
+  'firstrun-closed',
 ] as const
 export type Scenario = (typeof SCENARIOS)[number]
 
@@ -70,7 +71,7 @@ export interface MockState {
   people: Person[]
   system: SystemInfo
   offline: boolean
-  firstrun: { done: boolean; relayConfigured: boolean; unlocked: boolean; wrongPins: number; lockedUntil: number }
+  firstrun: { done: boolean; closed: boolean; relayConfigured: boolean; unlocked: boolean; wrongPins: number; lockedUntil: number }
   seq: number
 }
 
@@ -374,7 +375,7 @@ export function seed(scenario: Scenario, lang: Lang, slow: boolean): MockState {
     people: [],
     system: { version: '0.2.0', commit: '8cd45e2', os: 'darwin', arch: 'arm64', startedAt: iso(2 * HOUR + 15 * MIN) },
     offline: false,
-    firstrun: { done: false, relayConfigured: true, unlocked: false, wrongPins: 0, lockedUntil: 0 },
+    firstrun: { done: false, closed: false, relayConfigured: true, unlocked: false, wrongPins: 0, lockedUntil: 0 },
     seq: 0,
   }
   state.people = [
@@ -430,6 +431,11 @@ export function seed(scenario: Scenario, lang: Lang, slow: boolean): MockState {
       state.ownerReady = false
       state.firstrun.relayConfigured = false
       state.relay = { configured: false, state: 'not_configured' }
+      break
+    case 'firstrun-closed':
+      state.signedIn = false
+      state.ownerReady = false
+      state.firstrun.closed = true
       break
     case 'firstrun-done':
       state.firstrun.done = true

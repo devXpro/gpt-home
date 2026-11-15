@@ -2,6 +2,7 @@ package auth
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"slices"
 	"strings"
@@ -77,7 +78,7 @@ func TestRegistrationAndLogin(t *testing.T) {
 	if len(e.setups) != 1 || e.setups[0].ID != "roman" {
 		t.Fatalf("OnSetup %+v", e.setups)
 	}
-	if ready, _ := OwnerReady(ctx, e.st); !ready {
+	if ready, _ := OwnerReady(ctx, e.st, testDomain); !ready {
 		t.Fatal("owner not ready after setup")
 	}
 
@@ -431,4 +432,62 @@ func TestNoRelayDomain(t *testing.T) {
 	wantError(t, b.do(http.MethodPost, "/api/admin/auth/register/begin",
 		map[string]any{"token": token, "personName": "Roman"}), http.StatusServiceUnavailable, "home_not_ready")
 	wantError(t, b.do(http.MethodPost, "/local/api/admin/local/setup-link", map[string]any{}), http.StatusConflict, "relay_not_ready")
+}
+
+// Failed registrations, sign-ins, step-ups and passkey additions all reach the audit, with the client's address
+// (review L3); a successful registration names it too.
+func TestFailuresAreAudited(t *testing.T) {
+	e := newEnv(t)
+	phone := newDevice()
+	token := e.link()
+	attacker := e.browser()
+	attacker.xff = "203.0.113.7, 172.18.0.2"
+	bad := *phone
+	bad.rp.Origin = "https://evil.example.com"
+	wantError(t, attacker.register(&bad, token, map[string]string{"personName": "Mallory"}), http.StatusBadRequest, "webauthn_failed")
+	owner := e.browser()
+	owner.xff = "198.51.100.20, 172.18.0.2"
+	wantStatus(t, owner.register(phone, token, map[string]string{"personName": "Roman"}), http.StatusCreated)
+	// The link is used now: a second finish with a fresh ceremony fails at the token.
+	wantError(t, attacker.do(http.MethodPost, "/api/admin/auth/register/begin", map[string]any{"token": token}), http.StatusGone, "token_used")
+
+	wantError(t, attacker.login(newDevice()), http.StatusUnauthorized, "login_failed")
+	wantError(t, owner.stepUp(newDevice()), http.StatusUnauthorized, "login_failed")
+	e.clock.Add(time.Second) // still stepped up from the registration
+	raw, id := owner.begin("/api/admin/me/passkeys/begin", map[string]any{})
+	other := newDevice()
+	other.rp.ID = "evil.example.com"
+	wantError(t, owner.do(http.MethodPost, "/api/admin/me/passkeys/finish",
+		map[string]any{"ceremonyId": id, "credential": other.create(t, raw), "name": "Evil"}), http.StatusBadRequest, "webauthn_failed")
+
+	want := []struct {
+		action, client string
+		ok             bool
+	}{
+		{"setup.link", "", true},
+		{"auth.setup", "203.0.113.7", false},
+		{"auth.setup", "198.51.100.20", true},
+		{"auth.login_failed", "203.0.113.7", false},
+		{"auth.step_up", "198.51.100.20", false},
+		{"passkey.add", "198.51.100.20", false},
+	}
+	recs := e.audit()
+	if len(recs) != len(want) {
+		t.Fatalf("audit %+v", recs)
+	}
+	for i, w := range want {
+		r := recs[i]
+		var details struct {
+			Client string `json:"client"`
+		}
+		if len(r.Args) > 0 {
+			_ = json.Unmarshal(r.Args, &details)
+		}
+		if r.Action != w.action || r.OK != w.ok || details.Client != w.client || !w.ok && r.Error == "" {
+			t.Errorf("record %d = %+v (%s), want %+v", i, r, r.Args, w)
+		}
+	}
+	if recs[1].Person != "Mallory" || recs[4].PersonID == "" || recs[5].Target != "Evil" {
+		t.Errorf("who: %+v", recs)
+	}
 }

@@ -979,6 +979,7 @@ export const handlers = [
   // ------------------------------------------------ first-run LAN page (§5)
   http.all('/api/firstrun/*', ({ request }) => {
     if (db.firstrun.done) return fail(410, 'setup_done', 'the home has an owner')
+    if (db.firstrun.closed) return fail(410, 'setup_closed', 'the setup page is closed; open it again with homed admin firstrun')
     if (request.method !== 'GET' && request.headers.get('X-GPT-Home') !== '1') return fail(403, 'csrf_failed', 'missing X-GPT-Home header')
     return undefined
   }),
@@ -992,13 +993,13 @@ export const handlers = [
   http.post('/api/firstrun/pin', async ({ request }) => {
     await delay(350)
     const { pin } = await body<{ pin?: string }>(request)
-    // 5 wrong PINs lock the page until the 10-minute window ends; homed prints a new PIN meanwhile (T2.2).
+    // 5 wrong PINs lock this device until its 10-minute window ends (T2.F: per client; 20 in total close the page).
     const locked = () =>
-      fail(429, 'rate_limited', 'too many wrong PINs; a new PIN was printed', {}, {
+      fail(429, 'rate_limited', 'too many wrong PINs from this device; wait, then try again', {}, {
         'Retry-After': String(Math.max(1, Math.ceil((db.firstrun.lockedUntil - Date.now()) / 1000))),
       })
     if (db.firstrun.lockedUntil > Date.now()) return locked()
-    if (pin === '123456') {
+    if (pin?.replace(/[\s-]/g, '') === '12345678') {
       db.firstrun.unlocked = true
       db.firstrun.wrongPins = 0
       if (db.firstrun.relayConfigured && !relayLookOk(db.relay)) connectRelaySoon()
@@ -1033,7 +1034,7 @@ export const handlers = [
     if (!db.firstrun.unlocked) return fail(401, 'unauthenticated', 'enter the PIN first')
     await delay(300)
     if (!relayLookOk(db.relay)) return fail(409, 'relay_not_ready', 'the relay is not connected yet')
-    return HttpResponse.json({ url: `https://homie.jobbyjobs.work/admin/setup#t=${randomB64(32)}`, expiresAt: new Date(Date.now() + 15 * 60_000).toISOString() })
+    return HttpResponse.json({ url: `https://homie.jobbyjobs.work/admin/setup#t=${randomB64(32)}`, expiresAt: new Date(Date.now() + 3 * 60_000).toISOString() }) // LAN links live 3 minutes
   }),
 ]
 

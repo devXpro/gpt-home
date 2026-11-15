@@ -27,8 +27,14 @@ type relayJSON struct {
 	} `json:"selfCheck"`
 }
 
-// cmdRelayConnect stores a connect code: relay.domain into homed.yaml and the token into relay-token (0600). A running
-// homed switches to the relay at once. It never prints the code or the token.
+// errCodeInArgv refuses a connect code on the command line: it holds the relay token, and argv lands in shell history
+// and the process list. The message never repeats the argument.
+var errCodeInArgv = errors.New("the connect code is a secret and is never taken from the command line (shell " +
+	"history, the process list); give it on stdin: homed relay connect - (paste it and press Enter, or pipe it in, " +
+	"e.g. pbpaste | homed relay connect -)")
+
+// cmdRelayConnect stores a connect code read from stdin: relay.domain into homed.yaml and the token into relay-token
+// (0600). A running homed switches to the relay at once. It never prints the code or the token.
 func cmdRelayConnect(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
 	fl, dataDir := newFlags("relay connect", stderr)
 	pos, err := parseFlags(fl, args)
@@ -37,19 +43,17 @@ func cmdRelayConnect(args []string, stdin io.Reader, stdout, stderr io.Writer) e
 	}
 	switch {
 	case len(pos) == 0:
-		return errors.New("missing connect code; usage: homed relay connect [--data-dir D] <code | ->")
+		return errors.New("missing \"-\"; usage: homed relay connect [--data-dir D] - (the code comes on stdin)")
 	case len(pos) > 1:
-		return errors.New("too many arguments")
+		return errors.New("too many arguments; usage: homed relay connect [--data-dir D] -")
+	case pos[0] != "-":
+		return errCodeInArgv
 	}
-	codeArg := pos[0]
-	if codeArg == "-" {
-		line, err := bufio.NewReader(io.LimitReader(stdin, 4096)).ReadString('\n')
-		if err != nil && !errors.Is(err, io.EOF) {
-			return fmt.Errorf("read code from stdin: %w", err)
-		}
-		codeArg = line
+	line, err := bufio.NewReader(io.LimitReader(stdin, 4096)).ReadString('\n')
+	if err != nil && !errors.Is(err, io.EOF) {
+		return fmt.Errorf("read code from stdin: %w", err)
 	}
-	code, err := relay.ParseCode(codeArg)
+	code, err := relay.ParseCode(line)
 	if err != nil {
 		return err
 	}

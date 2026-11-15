@@ -319,7 +319,7 @@ func linkToken(t *testing.T, dir, wantPrefix string) string {
 	return token
 }
 
-var pinRe = regexp.MustCompile(`enter the PIN (\d{6})`)
+var pinRe = regexp.MustCompile(`enter the PIN (\d{4} \d{4})`)
 
 // firstRunPIN waits for the PIN homed prints to its terminal.
 func firstRunPIN(t *testing.T, term *syncBuffer) string {
@@ -492,6 +492,14 @@ people:
 	if !strings.Contains(out, "hello") || !strings.Contains(out, `"via": "cli"`) || !strings.Contains(out, `"caller": "Roman"`) {
 		t.Fatalf("tool call output:\n%s", out)
 	}
+	// "-" reads the arguments from stdin, so a secret never reaches argv (review L10).
+	if out, _, err := cli(t, `{"text":"from stdin"}`, "tool", "call", "fake_echo", "-", "--data-dir", dir); err != nil ||
+		!strings.Contains(out, "from stdin") {
+		t.Fatalf("tool call with stdin arguments: %v\n%s", err, out)
+	}
+	if _, _, err := cli(t, `[1]`, "tool", "call", "fake_echo", "-", "--data-dir", dir); err == nil || !strings.Contains(err.Error(), "JSON object") {
+		t.Fatalf("tool call with a stdin array: %v", err)
+	}
 	if _, errOut, err := cli(t, "", "tool", "call", "fake_fail", "--data-dir", dir); !errors.Is(err, errToolFailed) ||
 		!strings.Contains(errOut, "unreachable") {
 		t.Fatalf("failing tool: %v %q", err, errOut)
@@ -651,7 +659,7 @@ func checkAudit(t *testing.T, dir string) {
 // A relay that fails before it ever connects (here: the CA file is missing) shows why in `homed relay status`.
 func TestRelayConfigErrorInStatus(t *testing.T) {
 	dir := shortTempDir(t)
-	mustCLI(t, "relay", "connect", testCode(t, "homie.test"), "--data-dir", dir)
+	connectRelay(t, dir)
 	d, _ := startDaemon(t, runOptions{
 		dataDir: dir, listen: "127.0.0.1:" + strconv.Itoa(freePort(t)), setupListen: "127.0.0.1:0",
 		caFile: filepath.Join(dir, "missing-ca.pem"),
@@ -690,7 +698,7 @@ func TestRelayConnectAtRunTime(t *testing.T) {
 		t.Fatalf("a write with an origin before the relay: %d %s", code, raw)
 	}
 
-	out := mustCLI(t, "relay", "connect", testCode(t, "homie.test"), "--data-dir", dir)
+	out := connectRelay(t, dir)
 	if !strings.Contains(out, "connecting") || d.relay.Domain() != "homie.test" {
 		t.Fatalf("relay connect: %s (domain %q)", out, d.relay.Domain())
 	}
@@ -718,7 +726,7 @@ func TestRelayConnectAtRunTime(t *testing.T) {
 // --dev-origin: passkeys and setup links for localhost over plain http, and no relay at all.
 func TestDevMode(t *testing.T) {
 	relayDir := shortTempDir(t)
-	mustCLI(t, "relay", "connect", testCode(t, "homie.test"), "--data-dir", relayDir)
+	connectRelay(t, relayDir)
 	err := serve(context.Background(), runOptions{
 		dataDir: relayDir, listen: "127.0.0.1:" + strconv.Itoa(freePort(t)), devOrigin: "http://localhost:5173",
 	}, discardLog())
@@ -759,7 +767,7 @@ func TestDevMode(t *testing.T) {
 	if code, raw := b.do(http.MethodPut, "/api/admin/relay", map[string]string{"code": testCode(t, "homie.test")}); code != http.StatusServiceUnavailable {
 		t.Fatalf("relay change in development mode: %d %s", code, raw)
 	}
-	if _, _, err := cli(t, "", "relay", "connect", testCode(t, "homie.test"), "--data-dir", dir); err == nil {
+	if _, _, err := cli(t, testCode(t, "homie.test")+"\n", "relay", "connect", "-", "--data-dir", dir); err == nil {
 		t.Fatal("relay connect in development mode succeeded")
 	}
 }

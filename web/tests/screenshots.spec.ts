@@ -74,7 +74,7 @@ const SHOTS: Shot[] = [
     scenario: 'firstrun-norelay',
     ready: 'Введите PIN',
     prepare: async (p) => {
-      await p.getByRole('textbox', { name: 'Введите PIN' }).fill('123456')
+      await p.getByRole('textbox', { name: 'Введите PIN' }).fill('12345678')
       await expect(p.getByRole('heading', { name: 'Код сервера' })).toBeVisible()
     },
   },
@@ -85,7 +85,7 @@ const SHOTS: Shot[] = [
     extra: '&slow=1',
     ready: 'Введите PIN',
     prepare: async (p) => {
-      await p.getByRole('textbox', { name: 'Введите PIN' }).fill('123456')
+      await p.getByRole('textbox', { name: 'Введите PIN' }).fill('12345678')
       await expect(p.getByRole('heading', { name: /Подключаемся/ })).toBeVisible()
     },
   },
@@ -95,7 +95,7 @@ const SHOTS: Shot[] = [
     scenario: 'firstrun',
     ready: 'Введите PIN',
     prepare: async (p) => {
-      await p.getByRole('textbox', { name: 'Введите PIN' }).fill('123456')
+      await p.getByRole('textbox', { name: 'Введите PIN' }).fill('12345678')
       await expect(p.getByRole('heading', { name: 'Откройте дом на телефоне или здесь' })).toBeVisible({ timeout: 15_000 })
     },
   },

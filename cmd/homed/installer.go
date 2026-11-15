@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/devXpro/gpt-home/internal/admin"
@@ -29,6 +30,34 @@ type installer struct {
 	// restart asks homed to shut down gracefully and exit with install.ExitCodeRestart. Nil in the CLI's in-process
 	// admin, where nothing is running to install into or to restart.
 	restart func()
+	locks   pluginLocks
+}
+
+// pluginLocks lets one job at a time change a plugin: an install, an update and a removal of the same id would
+// otherwise race over its store row, its running process and its files. The admin refuses a second job for the same
+// target at once; an install from a repo learns its id only here, so the lock is taken here for every kind.
+type pluginLocks struct {
+	mu   sync.Mutex
+	busy map[string]bool
+}
+
+// lock takes id for the caller, or answers job_running while another job holds it. unlock releases it.
+func (l *pluginLocks) lock(id string) (unlock func(), err error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.busy[id] {
+		return nil, &admin.JobError{Code: "job_running",
+			Message: fmt.Sprintf("another install, update or removal of %s is running", id)}
+	}
+	if l.busy == nil {
+		l.busy = map[string]bool{}
+	}
+	l.busy[id] = true
+	return func() {
+		l.mu.Lock()
+		defer l.mu.Unlock()
+		delete(l.busy, id)
+	}, nil
 }
 
 var _ admin.Installer = (*installer)(nil)
@@ -95,6 +124,11 @@ func (i *installer) Install(ctx context.Context, repo, version, id string, repor
 		}
 		id = cand.Manifest.ID
 	}
+	unlock, err := i.locks.lock(id)
+	if err != nil {
+		return "", err
+	}
+	defer unlock()
 	if _, err := i.st.Plugins().Get(ctx, id); err == nil {
 		return "", &admin.JobError{Code: "conflict", Message: fmt.Sprintf("a plugin with the id %q is installed", id)}
 	} else if !errors.Is(err, store.ErrNotFound) {
@@ -126,11 +160,17 @@ func (i *installer) Install(ctx context.Context, repo, version, id string, repor
 }
 
 // Update implements admin.Installer: the new version is unpacked next to the running one, the store row switched to
-// it and the plugin restarted; when it does not come up, the old row and binary come back.
-func (i *installer) Update(ctx context.Context, id, version string, report admin.Reporter) error {
+// it and the plugin restarted; when it does not come up, the old row and binary come back. An older release is
+// refused unless allowDowngrade.
+func (i *installer) Update(ctx context.Context, id, version string, allowDowngrade bool, report admin.Reporter) error {
 	if i.restart == nil {
 		return errNotServing
 	}
+	unlock, err := i.locks.lock(id)
+	if err != nil {
+		return err
+	}
+	defer unlock()
 	row, err := i.st.Plugins().Get(ctx, id)
 	if err != nil {
 		return fmt.Errorf("plugin %s: %w", id, err)
@@ -152,7 +192,7 @@ func (i *installer) Update(ctx context.Context, id, version string, report admin
 		}
 		return i.startAndWait(ctx, id)
 	}
-	_, err = i.inst.Update(ctx, id, row.Repo, row.Version, version, h)
+	_, err = i.inst.Update(ctx, id, row.Repo, row.Version, version, allowDowngrade, h)
 	return jobError(err)
 }
 
@@ -169,6 +209,11 @@ func (i *installer) startAndWait(ctx context.Context, id string) error {
 // Remove implements admin.Installer: the plugin stops and leaves the store, then its files go (its data too unless
 // keepData).
 func (i *installer) Remove(ctx context.Context, id string, keepData bool, report admin.Reporter) error {
+	unlock, err := i.locks.lock(id)
+	if err != nil {
+		return err
+	}
+	defer unlock()
 	report(admin.JobReport{Step: "stop"})
 	if err := i.st.Plugins().Delete(ctx, id); err != nil && !errors.Is(err, store.ErrNotFound) {
 		return err
@@ -204,14 +249,14 @@ func (i *installer) LatestHub(ctx context.Context) (admin.HubRelease, error) {
 // UpdateHub implements admin.Installer: the new binary replaces the running one, the job ends, and a second later
 // homed shuts down gracefully and exits with install.ExitCodeRestart (75) for the service manager to start it again
 // (launchd KeepAlive, systemd Restart=; docs/DEV.md).
-func (i *installer) UpdateHub(ctx context.Context, version string, report admin.Reporter) error {
+func (i *installer) UpdateHub(ctx context.Context, version string, allowDowngrade bool, report admin.Reporter) error {
 	if i.restart == nil {
 		return errNotServing
 	}
 	if version != "" {
 		report(admin.JobReport{Message: version})
 	}
-	res, err := i.hub.Update(ctx, version, hooks(report))
+	res, err := i.hub.Update(ctx, version, allowDowngrade, hooks(report))
 	if err != nil {
 		return jobError(err)
 	}

@@ -44,7 +44,7 @@ and `$XDG_DATA_HOME/gpt-home` on Linux; every command takes `--data-dir D`, and 
 ```yaml
 # homed.yaml (phase 2)
 listen: 127.0.0.1:8080            # loopback only; the relay forwards here
-setup_listen: 0.0.0.0:8090        # the first-run page on the home network (default), until the owner has a passkey
+setup_listen: 127.0.0.1:8090      # optional: the first-run page; default 0.0.0.0:8090 without a relay, 127.0.0.1:8090 with one
 relay:
   domain: homie.jobbyjobs.work    # the token lives in relay-token
 ```
@@ -70,7 +70,8 @@ Then give the owner a passkey (§6). To go back to the phase 1 binary, stop home
 
 ## 4. Connect the relay
 
-The connect code goes through stdin, never through argv:
+The connect code goes through stdin, never through argv (`homed relay connect <code>` is refused: the code holds the
+relay token and would land in the shell history and the process list):
 
 ```sh
 security find-generic-password -s gpt-home-relay-code -a roman -w | "$G/bin/homed" relay connect -
@@ -107,18 +108,30 @@ Expect `homed listening addr=127.0.0.1:8080 … admin=https://homie.jobbyjobs.wo
 `relay connected` within seconds and `relay self-check passed` right after. `HOMED_LOG_LEVEL=debug` adds detail. Only
 one homed can run per data dir: a second one exits with "homed is already running".
 
-Until the owner has a passkey, homed also serves the **first-run page** on the home network and prints its address and
-a 6-digit PIN to the terminal:
+Until the owner has a passkey, homed also serves the **first-run page** and, when it runs in a terminal, prints its
+address and an 8-digit PIN there:
 
 ```
-homed first run: open http://192.168.68.63:8090/firstrun or http://localhost:8090/firstrun on your home network and enter the PIN 123456
+homed first run: open http://localhost:8090/firstrun and enter the PIN 4821 0937 (the page closes at 19:45)
 ```
 
 Open it, type the PIN, paste the relay code if homed has none yet, wait for "connected", then open the one-time link
 (a QR code for the phone, or "open on this computer" for Touch ID). It leads to `https://<domain>/admin/setup#t=…`:
-name the home, your name, create the passkey. The page closes itself two minutes after the owner registered; homed
-does not open it again once the owner has a passkey. macOS may ask once whether homed may accept incoming connections
-(the page listens on `0.0.0.0:8090`; `setup_listen` in homed.yaml or `--setup-listen` changes it).
+name the home, your name, create the passkey. A link from this page works once and for 3 minutes; "Новая ссылка"
+makes another. The page is plain http, so it is kept short-lived (docs/SECURITY.md):
+
+- it listens on the home network (`0.0.0.0:8090`) only while homed has no relay — macOS may then ask once whether
+  homed may accept incoming connections — and on `127.0.0.1:8090` once it has one (`setup_listen` in homed.yaml or
+  `--setup-listen` overrides both);
+- the PIN changes every 10 minutes and after every link (a terminal shows the new one);
+- the page closes 30 minutes after it opened, after 20 wrong PINs, and two minutes after the owner registered.
+
+`homed admin firstrun` (in a terminal on the home box, with homed running) prints the page's addresses and the current
+PIN, and opens the page again when it has closed:
+
+```sh
+"$G/bin/homed" admin firstrun       # The first-run page is open until 19:45 on: … PIN: 4821 0937
+```
 
 Without the page, from a terminal on the home box:
 
@@ -128,7 +141,7 @@ Without the page, from a terminal on the home box:
 ```
 
 The link is a secret until it is used. Both commands work with or without a running homed. Person keys (ChatGPT's
-access) survive a reset.
+access) and the relay token survive a reset; rotate them too after a compromise (docs/SECURITY.md).
 
 ## 7. The admin
 
@@ -139,15 +152,17 @@ hub update) ask for Face ID or Touch ID again when the last one is older than 5 
 
 ## 8. Set up the TV by hand (tool calls through the socket)
 
-`homed tool call <name> ['<json>']` calls any tool through the running homed as the owner, via `cli`, and writes the
-audit entry. It prints the plugin's progress to stderr while it runs, then the tool's text and its structured result.
-A tool that ran and failed prints its message to stderr and exits with status 1.
+`homed tool call <name> ['<json>' | -]` calls any tool through the running homed as the owner, via `cli`, and writes
+the audit entry. It prints the plugin's progress to stderr while it runs, then the tool's text and its structured
+result. A tool that ran and failed prints its message to stderr and exits with status 1. With `-` the arguments come
+from stdin: use it for anything secret (a pairing PIN), which must stay out of the shell history and the process list.
 
 ```sh
 "$G/bin/homed" tool call tv_discover
 "$G/bin/homed" tool call tv_add '{"host":"192.168.68.66","name":"Living room TV"}'
 "$G/bin/homed" tool call tv_pair '{"tv":"<id from tv_add>"}'    # … Press OK on the TV remote
 "$G/bin/homed" tool call tv_list
+printf '%s' '{"tv":"<id>","pin":"<from the TV>"}' | "$G/bin/homed" tool call tv_pair -   # a PIN, via stdin
 ```
 
 The same actions are in the admin: Устройства → Телевизоры.
@@ -226,9 +241,18 @@ tail -f ~/Library/Logs/gpt-home/homed.log
 ```
 
 launchd gives the agent `HOME`, so the default data dir is the same as in a terminal. The log file is not rotated; it
-stays small at the info level. Under launchd the first-run PIN goes to that log file; `homed admin setup-link` in a
-terminal is the simpler way there. On Linux the systemd unit needs `Restart=always` (or `on-failure`, with 75 kept out
-of `SuccessExitStatus=` and `RestartPreventExitStatus=`).
+stays small at the info level. Under launchd homed has no terminal, so it never prints the first-run PIN (the log says
+so instead): run `homed admin firstrun` in a terminal for the PIN, or `homed admin setup-link` for a link straight
+away. On Linux the systemd unit needs `Restart=always` (or `on-failure`, with 75 kept out of `SuccessExitStatus=` and
+`RestartPreventExitStatus=`).
+
+**Going back to an older version.** The admin never installs a release older than the one installed (plugins) or
+running (the hub). On the home box the socket can, with an explicit flag:
+
+```sh
+curl -sS --unix-socket "$D/homed.sock" -H 'Content-Type: application/json' \
+  -d '{"version":"0.1.0","allowDowngrade":true}' http://homed/api/admin/plugins/tv/update
+```
 
 **Local Network permission.** macOS asks once whether homed may find devices on the local network, the first time the
 TV plugin (a child of homed) talks to the LAN: discovery, wake, or any TV command. Click **Allow**. A homed started from
@@ -249,6 +273,8 @@ as offline): turn homed on in System Settings → Privacy & Security → Local N
 | the admin says the passkey does not open the home | the relay domain changed: `homed admin reset-access` (§6) |
 | `homed is not running` from a CLI command | start it (§6 or §10); `tool …` and `relay status` need it, the rest work without |
 | `/admin` answers 503 | homed was built without the SPA: `make -C "$G" build` |
+| the first-run page does not answer, or says it is closed | it closes after 30 minutes or 20 wrong PINs: `homed admin firstrun` |
+| `homed relay connect` says the code never goes on the command line | pipe it in: `… \| homed relay connect -` (§4) |
 
 ## Development without a relay or a TV
 

@@ -54,7 +54,7 @@ func TestHubUpdateReplacesBinaryAndKeepsBackup(t *testing.T) {
 	if err != nil || !newer || rel.Version != "0.3.0" {
 		t.Fatalf("Latest: %+v %v %v", rel, newer, err)
 	}
-	res, err := u.Update(t.Context(), "", &Hooks{Step: func(s string) { steps = append(steps, s) }})
+	res, err := u.Update(t.Context(), "", false, &Hooks{Step: func(s string) { steps = append(steps, s) }})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -96,11 +96,30 @@ func TestHubUpdateRefusals(t *testing.T) {
 		if err != nil || newer {
 			t.Fatalf("newer=%v err=%v", newer, err)
 		}
-		if _, err := u.Update(t.Context(), "", nil); !errors.Is(err, ErrUpToDate) {
+		if _, err := u.Update(t.Context(), "", false, nil); !errors.Is(err, ErrUpToDate) {
 			t.Fatalf("err = %v", err)
 		}
 		if readFile(t, exe) != oldHub {
 			t.Fatal("binary touched")
+		}
+	})
+	t.Run("an older release is a downgrade", func(t *testing.T) {
+		f := newFakeGitHub(t)
+		f.add("devXpro/gpt-home", homedRelease(t, oldHub+"# 0.3.0\n"))
+		u, exe := newHubUpdater(t, f, "0.4.1")
+		for _, version := range []string{"", "latest", "0.3.0"} {
+			if _, err := u.Update(t.Context(), version, false, nil); !errors.Is(err, ErrDowngrade) || Code(err) != "downgrade" {
+				t.Fatalf("%q: err = %v", version, err)
+			}
+		}
+		if readFile(t, exe) != oldHub {
+			t.Fatal("binary touched")
+		}
+		if _, err := u.Update(t.Context(), "0.3.0", true, nil); err != nil {
+			t.Fatalf("allowed downgrade: %v", err)
+		}
+		if readFile(t, exe) != oldHub+"# 0.3.0\n" {
+			t.Fatal("the allowed downgrade did not replace the binary")
 		}
 	})
 	t.Run("checksum mismatch leaves the binary alone", func(t *testing.T) {
@@ -109,7 +128,7 @@ func TestHubUpdateRefusals(t *testing.T) {
 		r.sums = map[string]string{ArchiveName("homed", "0.3.0", "linux", "arm64"): strings.Repeat("a", 64)}
 		f.add("devXpro/gpt-home", r)
 		u, exe := newHubUpdater(t, f, "0.2.0")
-		if _, err := u.Update(t.Context(), "", nil); !errors.Is(err, ErrChecksumMismatch) {
+		if _, err := u.Update(t.Context(), "", false, nil); !errors.Is(err, ErrChecksumMismatch) {
 			t.Fatalf("err = %v", err)
 		}
 		if readFile(t, exe) != oldHub {
@@ -121,7 +140,7 @@ func TestHubUpdateRefusals(t *testing.T) {
 		f.add("devXpro/gpt-home", homedRelease(t, oldHub))
 		u, _ := newHubUpdater(t, f, "0.2.0")
 		u.GOOS = "plan9"
-		if _, err := u.Update(t.Context(), "", nil); !errors.Is(err, ErrNoAsset) {
+		if _, err := u.Update(t.Context(), "", false, nil); !errors.Is(err, ErrNoAsset) {
 			t.Fatalf("err = %v", err)
 		}
 	})
@@ -129,14 +148,14 @@ func TestHubUpdateRefusals(t *testing.T) {
 		f := newFakeGitHub(t)
 		f.add("devXpro/gpt-home", homedRelease(t, "#!/bin/sh\nexit 3\n"))
 		u, exe := newHubUpdater(t, f, "0.2.0")
-		if _, err := u.Update(t.Context(), "", nil); !errors.Is(err, ErrStartFailed) {
+		if _, err := u.Update(t.Context(), "", false, nil); !errors.Is(err, ErrStartFailed) {
 			t.Fatalf("err = %v", err)
 		}
 		if readFile(t, exe) != oldHub {
 			t.Fatal("binary touched")
 		}
 		u.SkipSmokeTest = true
-		if _, err := u.Update(t.Context(), "", nil); err != nil {
+		if _, err := u.Update(t.Context(), "", false, nil); err != nil {
 			t.Fatalf("with the self-test skipped: %v", err)
 		}
 	})
@@ -152,7 +171,7 @@ func TestHubUpdateRefusals(t *testing.T) {
 		if os.Geteuid() == 0 {
 			t.Skip("root ignores directory permissions")
 		}
-		if _, err := u.Update(t.Context(), "", nil); !errors.Is(err, ErrNotWritable) {
+		if _, err := u.Update(t.Context(), "", false, nil); !errors.Is(err, ErrNotWritable) {
 			t.Fatalf("err = %v", err)
 		}
 	})
@@ -167,7 +186,7 @@ func TestHubUpdateFollowsSymlinkedExecutable(t *testing.T) {
 		t.Fatal(err)
 	}
 	u.ExePath = link
-	if _, err := u.Update(t.Context(), "0.3.0", nil); err != nil {
+	if _, err := u.Update(t.Context(), "0.3.0", false, nil); err != nil {
 		t.Fatal(err)
 	}
 	if fi, err := os.Lstat(link); err != nil || fi.Mode()&os.ModeSymlink == 0 {

@@ -2,8 +2,8 @@
 // plugins and their tools, admin tool calls with progress, jobs, the audit log, people and keys, settings, the relay,
 // the system info, and the server-sent event stream.
 //
-// The package does not import internal/auth or internal/install, and uses internal/plugins only for its progress
-// context (plugins.WithProgress). It names the few methods it needs as interfaces below (Auth, PluginHost,
+// The package does not import internal/auth or internal/install, uses internal/auth/wire only for the shared name rule
+// (wire.CheckName) and internal/plugins only for its progress context (plugins.WithProgress). It names the few methods it needs as interfaces below (Auth, PluginHost,
 // PluginRuntime, Relay, Installer, KeyUpdater), and the integration (T2.6) adapts the real packages to them.
 // Persistence goes through internal/store.
 //
@@ -20,7 +20,6 @@ import (
 	"time"
 
 	"github.com/devXpro/gpt-home/internal/hub"
-	"github.com/devXpro/gpt-home/internal/keys"
 	"github.com/devXpro/gpt-home/internal/plugins"
 	"github.com/devXpro/gpt-home/internal/relay"
 	"github.com/devXpro/gpt-home/internal/store"
@@ -83,9 +82,12 @@ type Relay interface {
 	Connect(ctx context.Context, code relay.Code) error
 }
 
-// KeyUpdater receives the full key set after every key change; *keys.Resolver implements it.
+// KeyUpdater rebuilds the gateway's key set from the store after every key or person change (cmd/homed's key
+// resolver). Rebuild must read the store and swap the set under one lock that every other rebuild (SIGHUP, a
+// registration) takes too: a rebuild that read the store before a revoke must never land after it and bring the
+// revoked key back.
 type KeyUpdater interface {
-	Update(entries []keys.Entry) error
+	Rebuild(ctx context.Context) error
 }
 
 // JobReport is one progress report of a running job.
@@ -137,18 +139,19 @@ type HubRelease struct {
 // Installer is the plugin installer and self-updater (T2.5) as the admin sees it. Install, Update, Remove and
 // UpdateHub run inside a job: they report steps through the Reporter and do every store and runtime change
 // themselves (store row, atomic switch, start, rollback). Errors other than *JobError and ErrNotFound count as
-// upstream failures where GitHub is involved.
+// upstream failures where GitHub is involved. Update and UpdateHub refuse a release older than the installed one
+// (job error "downgrade") unless allowDowngrade, which the admin passes only for an explicit request on the socket.
 type Installer interface {
 	Preview(ctx context.Context, repo, version string) (PluginPreview, error)
 	Install(ctx context.Context, repo, version, id string, report Reporter) (pluginID string, err error)
-	Update(ctx context.Context, id, version string, report Reporter) error
+	Update(ctx context.Context, id, version string, allowDowngrade bool, report Reporter) error
 	Remove(ctx context.Context, id string, keepData bool, report Reporter) error
 	// LatestVersion returns the latest release version of a plugin repo.
 	LatestVersion(ctx context.Context, repo string) (string, error)
 	// LatestHub returns the latest hub release.
 	LatestHub(ctx context.Context) (HubRelease, error)
 	// UpdateHub replaces the homed binary; homed exits afterwards and the service manager restarts it.
-	UpdateHub(ctx context.Context, version string, report Reporter) error
+	UpdateHub(ctx context.Context, version string, allowDowngrade bool, report Reporter) error
 }
 
 // Options configures the admin API. Store and Host are required.
@@ -168,6 +171,10 @@ type Options struct {
 	WithProgress func(ctx context.Context, fn func(plugins.Progress)) context.Context
 	// OnSettings is called after the settings changed (the gateway's home name and instructions follow it).
 	OnSettings func(store.HomeSettings)
+	// UsablePasskey reports whether a passkey can sign in now: it belongs to the current relying party (the relay
+	// domain). Only those count for bootstrap's ownerReady and the last-passkey rule; passkeys of an old relay domain
+	// open nothing. Nil counts every passkey. homed passes auth.Auth.UsablePasskey.
+	UsablePasskey func(store.Passkey) bool
 
 	// Origin is the only allowed Origin of a mutating web request, e.g. "https://homie.jobbyjobs.work".
 	Origin string

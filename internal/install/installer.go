@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -175,9 +176,10 @@ func (i *Installer) Install(ctx context.Context, repo, version, wantID string, h
 
 // Update moves an installed plugin from current to version ("" or "latest" is the latest release): download,
 // verify, unpack, hooks.Switch, hooks.Start. If Start fails, hooks.Rollback restores current and the new files
-// are removed; the error then wraps ErrStartFailed and ErrRolledBack. ErrUpToDate when version is current. After
-// a success only the new and the previous version stay on disk.
-func (i *Installer) Update(ctx context.Context, id, repo, current, version string, hooks *Hooks) (*Installed, error) {
+// are removed; the error then wraps ErrStartFailed and ErrRolledBack. ErrUpToDate when version is current, and
+// ErrDowngrade when it is older (also when "latest" resolves to an older release) unless allowDowngrade. After a
+// success only the new and the previous version stay on disk.
+func (i *Installer) Update(ctx context.Context, id, repo, current, version string, allowDowngrade bool, hooks *Hooks) (*Installed, error) {
 	if err := checkID(id); err != nil {
 		return nil, err
 	}
@@ -191,6 +193,9 @@ func (i *Installer) Update(ctx context.Context, id, repo, current, version strin
 	}
 	if cand.Release.Version == current {
 		return nil, fmt.Errorf("%w: %s %s", ErrUpToDate, id, current)
+	}
+	if !allowDowngrade && older(cand.Release.Version, current) {
+		return nil, fmt.Errorf("%w: %s %s is installed, the release is %s", ErrDowngrade, id, current, cand.Release.Version)
 	}
 	if err := cand.Err(); err != nil {
 		return nil, err
@@ -285,7 +290,7 @@ func (i *Installer) Fetch(ctx context.Context, cand *Candidate, hooks *Hooks) (*
 		return nil, err
 	}
 	// The verified-over-https manifest is stored next to the binary so Locate works offline.
-	if err := os.WriteFile(filepath.Join(unpacked, ManifestAsset), cand.RawManifest, 0o644); err != nil { //nolint:gosec // not a secret
+	if err := writeManifest(unpacked, cand.RawManifest); err != nil {
 		return nil, err
 	}
 
@@ -297,6 +302,36 @@ func (i *Installer) Fetch(ctx context.Context, cand *Candidate, hooks *Hooks) (*
 		return nil, err
 	}
 	return installedFrom(m, cand.Release.Repo, rel.Version, final), nil
+}
+
+// writeManifest stores the released manifest in dir, through os.Root: the last path component is opened with
+// O_NOFOLLOW and O_CREATE|O_EXCL refuses any existing name, a link included, so nothing the archive left there can
+// redirect the write. A regular file of the same name from the archive is replaced by the released manifest.
+func writeManifest(dir string, data []byte) error {
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		return err
+	}
+	defer root.Close()
+	if fi, err := root.Lstat(ManifestAsset); err == nil {
+		if !fi.Mode().IsRegular() {
+			return fmt.Errorf("%w: the archive holds a %s that is not a file", ErrUnsafeArchive, ManifestAsset)
+		}
+		if err := root.Remove(ManifestAsset); err != nil {
+			return err
+		}
+	} else if !errors.Is(err, fs.ErrNotExist) {
+		return err
+	}
+	f, err := root.OpenFile(ManifestAsset, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
+	if err != nil {
+		return err
+	}
+	_, err = f.Write(data)
+	if cerr := f.Close(); err == nil {
+		err = cerr
+	}
+	return err
 }
 
 func installedFrom(m *Manifest, repo, version, dir string) *Installed {
@@ -396,6 +431,17 @@ func (i *Installer) removeVersion(id, version string) error {
 		return err
 	}
 	return os.RemoveAll(i.VersionDir(id, version))
+}
+
+// older reports whether release v is older than the installed version current. An unknown current ("" or a
+// development build) has nothing to go back from; a version that does not compare counts as older, so it needs the
+// same explicit permission.
+func older(v, current string) bool {
+	if isDevVersion(current) {
+		return false
+	}
+	c, err := CompareVersions(v, current)
+	return err != nil || c < 0
 }
 
 func checkID(id string) error {

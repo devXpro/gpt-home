@@ -35,16 +35,16 @@ var (
 
 // Handler serves the passkey ceremonies, mounted with full paths (internal/admin's Options.AuthRoutes):
 //
-//	POST /api/admin/auth/token             public, rate limited
-//	POST /api/admin/auth/register/begin    public, rate limited
-//	POST /api/admin/auth/register/finish   public, rate limited
-//	POST /api/admin/auth/login/begin       public, rate limited
-//	POST /api/admin/auth/login/finish      public, rate limited
-//	POST /api/admin/auth/stepup/begin      session, rate limited
-//	POST /api/admin/auth/stepup/finish     session, rate limited
+//	POST /api/admin/auth/token             public, rate limited per client address and in total
+//	POST /api/admin/auth/register/begin    public, rate limited per client address and in total
+//	POST /api/admin/auth/register/finish   public, rate limited per client address and in total
+//	POST /api/admin/auth/login/begin       public, begins and failed finishes limited per client address
+//	POST /api/admin/auth/login/finish      public, begins and failed finishes limited per client address
+//	POST /api/admin/auth/stepup/begin      session, begins and failed finishes limited per session
+//	POST /api/admin/auth/stepup/finish     session, begins and failed finishes limited per session
 //	POST /api/admin/auth/logout            session
-//	POST /api/admin/me/passkeys/begin      session + step-up
-//	POST /api/admin/me/passkeys/finish     session + step-up
+//	POST /api/admin/me/passkeys/begin      session + step-up, begins and failed finishes limited per session
+//	POST /api/admin/me/passkeys/finish     session + step-up, begins and failed finishes limited per session
 //
 // It applies the CSRF rule of ADMIN-API §1.4 and its own session and step-up checks, so it is safe on its own; the
 // admin's checks in front of it are harmless repeats. Other paths under /api/admin/auth/ answer 404.
@@ -52,16 +52,16 @@ func (a *Auth) Handler() http.Handler {
 	mux := http.NewServeMux()
 	const base = "/api/admin"
 	for path, h := range map[string]http.Handler{
-		"/auth/token":           a.route(true, a.tokenInfo),
-		"/auth/register/begin":  a.route(true, a.registerBegin),
-		"/auth/register/finish": a.route(true, a.registerFinish),
-		"/auth/login/begin":     a.route(true, a.loginBegin),
-		"/auth/login/finish":    a.route(true, a.loginFinish),
-		"/auth/stepup/begin":    a.route(true, a.stepUpBegin),
-		"/auth/stepup/finish":   a.route(true, a.stepUpFinish),
-		"/auth/logout":          a.route(false, a.logout),
-		"/me/passkeys/begin":    a.route(false, a.passkeyBegin),
-		"/me/passkeys/finish":   a.route(false, a.passkeyFinish),
+		"/auth/token":           a.route(rateToken, a.tokenInfo),
+		"/auth/register/begin":  a.route(rateToken, a.registerBegin),
+		"/auth/register/finish": a.route(rateToken, a.registerFinish),
+		"/auth/login/begin":     a.route(rateLoginBegin, a.loginBegin),
+		"/auth/login/finish":    a.route(rateLoginFinish, a.loginFinish),
+		"/auth/stepup/begin":    a.route(rateStepUpBegin, a.stepUpBegin),
+		"/auth/stepup/finish":   a.route(rateStepUpFinish, a.stepUpFinish),
+		"/auth/logout":          a.route(rateNone, a.logout),
+		"/me/passkeys/begin":    a.route(ratePasskeyBegin, a.passkeyBegin),
+		"/me/passkeys/finish":   a.route(ratePasskeyFinish, a.passkeyFinish),
 		"/auth/":                notFound(),
 	} {
 		mux.Handle(base+path, h)
@@ -71,13 +71,29 @@ func (a *Auth) Handler() http.Handler {
 
 type handlerFunc func(w http.ResponseWriter, r *http.Request) error
 
-// route wraps an endpoint: the common headers, POST only, the CSRF rule and, for limited ones, the auth rate limit.
-func (a *Auth) route(limited bool, h handlerFunc) http.Handler {
+// rateClass names the buckets an endpoint uses (ratelimit.go, ADMIN-API §1.7).
+type rateClass int
+
+const (
+	rateNone          rateClass = iota
+	rateToken                   // every request: per client address and in total
+	rateLoginBegin              // per client address: a begin, refused while the failures are spent
+	rateLoginFinish             // per client address: refused while the failures are spent; a failure is counted
+	rateStepUpBegin             // per session, as rateLoginBegin
+	rateStepUpFinish            // per session, as rateLoginFinish
+	ratePasskeyBegin            // per session, as rateLoginBegin
+	ratePasskeyFinish           // per session, as rateLoginFinish
+)
+
+// route wraps an endpoint: the common headers, POST only, the CSRF rule and the endpoint's rate limit; a finish that
+// failed to verify is counted against its client or session afterwards.
+func (a *Auth) route(rc rateClass, h handlerFunc) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		wire.Headers(w)
-		err := a.admit(w, r, limited)
+		err := a.admit(w, r, rc)
 		if err == nil {
 			err = h(w, r)
+			a.countFailure(r, rc, err)
 		}
 		if err != nil {
 			a.writeError(w, r, err)
@@ -85,7 +101,7 @@ func (a *Auth) route(limited bool, h handlerFunc) http.Handler {
 	})
 }
 
-func (a *Auth) admit(w http.ResponseWriter, r *http.Request, limited bool) error {
+func (a *Auth) admit(w http.ResponseWriter, r *http.Request, rc rateClass) error {
 	if r.Method != http.MethodPost {
 		w.Header().Set("Allow", http.MethodPost)
 		return wire.Errorf(http.StatusMethodNotAllowed, "method_not_allowed", r.Method+" is not allowed here")
@@ -93,13 +109,47 @@ func (a *Auth) admit(w http.ResponseWriter, r *http.Request, limited bool) error
 	if !a.sameOrigin(r) {
 		return errCSRF
 	}
-	if limited {
-		if ok, wait := a.limit.allow(ClientAddr(r), a.now()); !ok {
-			return &wire.Error{Status: http.StatusTooManyRequests, Code: "rate_limited",
-				Message: "too many sign-in attempts; try again later", RetryAfter: wait}
-		}
+	now, ok, wait := a.now(), true, time.Duration(0)
+	switch rc {
+	case rateNone:
+	case rateToken:
+		ok, wait = a.limits.token.take(ClientAddr(r), now)
+	case rateLoginBegin:
+		ok, wait = a.limits.login.begin(ClientAddr(r), now)
+	case rateLoginFinish:
+		ok, wait = a.limits.login.finish(ClientAddr(r), now)
+	case rateStepUpBegin:
+		ok, wait = a.limits.stepUp.begin(sessionKey(r), now)
+	case rateStepUpFinish:
+		ok, wait = a.limits.stepUp.finish(sessionKey(r), now)
+	case ratePasskeyBegin:
+		ok, wait = a.limits.passkey.begin(sessionKey(r), now)
+	case ratePasskeyFinish:
+		ok, wait = a.limits.passkey.finish(sessionKey(r), now)
+	}
+	if !ok {
+		return &wire.Error{Status: http.StatusTooManyRequests, Code: "rate_limited",
+			Message: "too many attempts; try again later", RetryAfter: wait}
 	}
 	return nil
+}
+
+// countFailure counts a finish whose passkey or ceremony did not verify against its client address or session.
+// Successful finishes, and failures for other reasons (no session, step-up needed), cost nothing.
+func (a *Auth) countFailure(r *http.Request, rc rateClass, err error) {
+	we, ok := errors.AsType[*wire.Error](err)
+	if !ok || we.Code != "webauthn_failed" && we.Code != "login_failed" {
+		return
+	}
+	now := a.now()
+	switch rc {
+	case rateLoginFinish:
+		a.limits.login.failed(ClientAddr(r), now)
+	case rateStepUpFinish:
+		a.limits.stepUp.failed(sessionKey(r), now)
+	case ratePasskeyFinish:
+		a.limits.passkey.failed(sessionKey(r), now)
+	}
 }
 
 // sameOrigin is the CSRF rule of ADMIN-API §1.4 for mutating requests: the X-GPT-Home header, an Origin (when sent)
@@ -279,7 +329,7 @@ func (a *Auth) registerBegin(w http.ResponseWriter, r *http.Request) error {
 	if err != nil {
 		return err
 	}
-	c := &ceremony{kind: kindRegister, rp: rp, tokenHash: inv.TokenHash}
+	c := &ceremony{kind: kindRegister, rp: rp, tokenHash: inv.TokenHash, inviteKind: inv.Kind}
 	if inv.Kind == store.InviteSetup { // a family member keeps the name the owner gave them
 		if body.PersonName != nil {
 			if c.personName, err = checkName("/personName", *body.PersonName); err != nil {
@@ -345,15 +395,16 @@ func (a *Auth) registerFinish(w http.ResponseWriter, r *http.Request) error {
 	if !ok {
 		return errCeremony
 	}
+	ctx := r.Context()
 	cred, err := a.verifyRegistration(r, c, body.Credential)
 	if err != nil {
+		a.registrationFailed(ctx, r, c, err)
 		return err
 	}
 	blob, err := encodeCredential(c.rp.ID, cred)
 	if err != nil {
 		return err
 	}
-	ctx := r.Context()
 	token, sess := a.newSession("", passkeyID(cred.ID), r.UserAgent(), now)
 	var (
 		person store.Person
@@ -392,19 +443,42 @@ func (a *Auth) registerFinish(w http.ResponseWriter, r *http.Request) error {
 		return tx.Sessions().Create(ctx, sess)
 	})
 	if err != nil {
+		a.registrationFailed(ctx, r, c, err)
 		return err
 	}
-	action := "auth.setup"
-	if kind == store.InviteMember {
-		action = "auth.join"
-	}
+	action := registrationAction(kind)
 	a.record(ctx, store.AuditRecord{
 		At: now, PersonID: person.ID, Person: person.Name, Via: "admin", Action: action, Target: person.ID, OK: true,
+		Args: clientDetails(r),
 	})
+	a.log.Info("auth: a passkey was registered with a one-time link", "action", action, "person", person.ID,
+		"client", ClientAddr(r))
 	if a.onSetup != nil {
 		a.onSetup(person, hs)
 	}
 	return a.signIn(w, r, http.StatusCreated, token, person, sess, hs)
+}
+
+// registrationAction is the audit action of a registration: auth.setup with a setup link, auth.join with an invite.
+func registrationAction(kind store.InviteKind) string {
+	if kind == store.InviteMember {
+		return "auth.join"
+	}
+	return "auth.setup"
+}
+
+// registrationFailed audits a registration whose finish failed for the client's reasons (the passkey did not verify,
+// the link was used or expired meanwhile, the passkey exists): its action with ok=false, the reason and the client's
+// address. Store failures are logged as internal errors instead; they say nothing about the client.
+func (a *Auth) registrationFailed(ctx context.Context, r *http.Request, c *ceremony, err error) {
+	we, ok := errors.AsType[*wire.Error](err)
+	if !ok {
+		return
+	}
+	a.record(ctx, store.AuditRecord{
+		PersonID: c.person.ID, Person: c.person.Name, Via: "admin", Action: registrationAction(c.inviteKind),
+		Target: c.person.ID, Error: we.Message, Args: clientDetails(r),
+	})
 }
 
 // registeringPerson returns the person a registration stores the passkey for, inside its transaction: the one the
@@ -530,7 +604,8 @@ func (a *Auth) loginFinish(w http.ResponseWriter, r *http.Request) error {
 	ctx := r.Context()
 	person, cred, err := a.verifyLogin(r, c, body.Credential)
 	if errors.Is(err, errLoginFailed) {
-		a.record(ctx, store.AuditRecord{At: now, Via: "admin", Action: "auth.login_failed", Error: "the passkey did not verify"})
+		a.record(ctx, store.AuditRecord{At: now, Via: "admin", Action: "auth.login_failed", Error: "the passkey did not verify",
+			Args: clientDetails(r)})
 	}
 	if err != nil {
 		return err
@@ -649,6 +724,10 @@ func (a *Auth) stepUpFinish(w http.ResponseWriter, r *http.Request) error {
 	}
 	ctx := r.Context()
 	cred, err := a.verifyAssertion(r, c, p.Person, body.Credential)
+	if errors.Is(err, errLoginFailed) {
+		a.record(ctx, store.AuditRecord{At: now, PersonID: p.Person.ID, Person: p.Person.Name, Via: "admin",
+			Action: "auth.step_up", Error: "the passkey did not verify", Args: clientDetails(r)})
+	}
 	if err != nil {
 		return err
 	}
@@ -783,8 +862,17 @@ func (a *Auth) passkeyFinish(w http.ResponseWriter, r *http.Request) error {
 	if !ok {
 		return errCeremony
 	}
+	ctx := r.Context()
+	failed := func(we *wire.Error) error {
+		a.record(ctx, store.AuditRecord{At: now, PersonID: p.Person.ID, Person: p.Person.Name, Via: "admin",
+			Action: "passkey.add", Target: name, Error: we.Message, Args: clientDetails(r)})
+		return we
+	}
 	cred, err := a.verifyRegistration(r, c, body.Credential)
 	if err != nil {
+		if errors.Is(err, errWebAuthn) {
+			return failed(errWebAuthn)
+		}
 		return err
 	}
 	blob, err := encodeCredential(c.rp.ID, cred)
@@ -795,10 +883,9 @@ func (a *Auth) passkeyFinish(w http.ResponseWriter, r *http.Request) error {
 		ID: passkeyID(cred.ID), PersonID: p.Person.ID, Name: name, Provider: providerName(cred.Authenticator.AAGUID),
 		Credential: blob, CreatedAt: now,
 	}
-	ctx := r.Context()
 	err = a.st.Passkeys().Create(ctx, pk)
 	if errors.Is(err, store.ErrConflict) {
-		return errPasskeyExists
+		return failed(errPasskeyExists)
 	}
 	if err != nil {
 		return err

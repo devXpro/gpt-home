@@ -383,9 +383,10 @@ fragment once, kept in memory, and the fragment is removed with `history.replace
 Served by the setup listener (T2.2) from the same `internal/web` bundle (route `/firstrun`), until an owner exists.
 Same look; no tab bar; centered column 420 px. Data: API §5.
 
-1. **PIN** — `title-1` `lan.pin.title`; six one-digit boxes (`inputmode="numeric"`, `autocomplete="one-time-code"`,
-   paste fills all), auto-submit on the sixth digit. `wrong_pin` → shake (`x: [0,-8,8,-4,4,0]`, 0.3 s; reduced motion:
-   none) and `lan.pin.wrong`; `rate_limited` → `lan.pin.locked`.
+1. **PIN** — `title-1` `lan.pin.title`; eight one-digit boxes in two groups of four, as homed prints the PIN
+   (`inputmode="numeric"`, `autocomplete="one-time-code"`, paste fills all, a pasted space is ignored), auto-submit on
+   the eighth digit. `wrong_pin` → shake (`x: [0,-8,8,-4,4,0]`, 0.3 s; reduced motion: none) and `lan.pin.wrong`;
+   `rate_limited` → `lan.pin.locked` (this device waits; T2.F).
 2. **Server code** (skipped when a relay is configured) — `TextField` (monospace, 3 rows) for the `ghr1.` code,
    `lan.code.text`, button `lan.code.button`. Bad code → `lan.code.invalid`.
 3. **Connecting** — `StatusOrb` + `lan.connecting` with the domain; SSE `relay` events. After 60 s without
@@ -394,13 +395,16 @@ Same look; no tab bar; centered column 420 px. Data: API §5.
    `lan.link.open` (opens the link here, for a Mac with Touch ID), `CopyField`, and the footnote `lan.link.expires`
    with a live countdown. "Новая ссылка" (plain) makes another.
 5. **Done** (`410 setup_done`) — `lan.done`.
+6. **Closed** (`410 setup_closed`: 30 minutes passed or 20 wrong PINs) — `lan.closed.title` and `lan.closed.text`.
 
 | Key | RU | EN |
 |---|---|---|
 | `lan.pin.title` | Введите PIN | Enter the PIN |
-| `lan.pin.text` | Он напечатан в окне, где запущен homed. | It's printed in the window where homed runs. |
+| `lan.pin.text` | Он в окне, где запущен homed, или выполните homed admin firstrun на домашнем компьютере. | It's in the window where homed runs, or run homed admin firstrun on the home computer. |
 | `lan.pin.wrong` | PIN не тот. Проверьте ещё раз. | Wrong PIN. Check it again. |
-| `lan.pin.locked` | Слишком много попыток. В окне homed появился новый PIN. | Too many tries. homed printed a new PIN. |
+| `lan.pin.locked` | Слишком много попыток с этого устройства. Попробуйте снова через {{time}}. | Too many tries from this device. Try again in {{time}}. |
+| `lan.closed.title` | Страница настройки закрыта | The setup page is closed |
+| `lan.closed.text` | На домашнем компьютере выполните homed admin firstrun, чтобы открыть её снова, или homed admin setup-link, чтобы получить ссылку. | On the home computer, run homed admin firstrun to open it again, or homed admin setup-link for a link. |
 | `lan.code.title` | Код сервера | Server code |
 | `lan.code.text` | Вставьте код, который выдал сервер при установке. Он начинается с ghr1. | Paste the code your server printed at install. It starts with ghr1. |
 | `lan.code.button` | Подключить | Connect |

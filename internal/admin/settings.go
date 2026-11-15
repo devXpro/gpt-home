@@ -204,9 +204,13 @@ func (s *Server) checkHubUpdate(q *request) error {
 
 func (s *Server) updateHub(q *request) error {
 	var body struct {
-		Version string `json:"version"`
+		Version        string `json:"version"`
+		AllowDowngrade bool   `json:"allowDowngrade"`
 	}
 	if err := decode(q, &body); err != nil {
+		return err
+	}
+	if err := checkDowngrade(q, body.AllowDowngrade, body.Version, s.opts.Version); err != nil {
 		return err
 	}
 	if s.opts.Installer == nil {
@@ -214,7 +218,7 @@ func (s *Server) updateHub(q *request) error {
 	}
 	inst := s.opts.Installer
 	job, err := s.startJob(q, "hub.update", "", func(ctx context.Context, report Reporter) (string, error) {
-		return "", inst.UpdateHub(ctx, body.Version, report)
+		return "", inst.UpdateHub(ctx, body.Version, body.AllowDowngrade, report)
 	})
 	if err != nil {
 		return err

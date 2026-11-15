@@ -57,8 +57,8 @@ const DefaultListen = "127.0.0.1:8080"
 // Config is homed.yaml.
 type Config struct {
 	Listen string `yaml:"listen,omitempty"`
-	// SetupListen is the first-run page's address on the home network; empty means firstrun.DefaultListen
-	// (0.0.0.0:8090). The page runs only until the home has an owner with a passkey.
+	// SetupListen is the first-run page's address; empty means firstrun.DefaultListen (0.0.0.0:8090 while there is
+	// no relay, 127.0.0.1:8090 with one). The page runs only until the home has an owner with a passkey.
 	SetupListen string `yaml:"setup_listen,omitempty"`
 	Relay       Relay  `yaml:"relay,omitempty"`
 

@@ -1,10 +1,14 @@
-.PHONY: lint test build web site-test e2e
+.PHONY: lint test vuln build web site-test e2e
 
 lint:
 	golangci-lint run ./...
 
 test:
 	go test -race ./...
+
+# Known vulnerabilities reachable from the code (the go.mod toolchain's standard library and every module); CI runs it too.
+vuln:
+	go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 ./...
 
 # homed embeds the admin SPA (internal/web/dist), so the SPA is built first; without it /admin answers 503.
 build: web

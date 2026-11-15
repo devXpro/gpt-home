@@ -90,8 +90,9 @@ func (u *HubUpdater) newer(v string) bool {
 // to a temporary directory, smoke-tests it and atomically swaps it over the running binary (a same-directory
 // rename; the old binary stays at ExePath+".prev"). It does not exit: the caller finishes its job, shuts homed
 // down gracefully and calls os.Exit(ExitCodeRestart) so the service manager starts the new binary. A package-
-// manager-owned or read-only location gives ErrNotWritable; then the update has to go through that manager.
-func (u *HubUpdater) Update(ctx context.Context, version string, hooks *Hooks) (*HubUpdate, error) {
+// manager-owned or read-only location gives ErrNotWritable; then the update has to go through that manager. A
+// release older than the running version is ErrDowngrade unless allowDowngrade.
+func (u *HubUpdater) Update(ctx context.Context, version string, allowDowngrade bool, hooks *Hooks) (*HubUpdate, error) {
 	hooks.step(StepResolve)
 	exe, err := u.exe()
 	if err != nil {
@@ -108,6 +109,9 @@ func (u *HubUpdater) Update(ctx context.Context, version string, hooks *Hooks) (
 	}
 	if rel.Version == u.Version {
 		return nil, fmt.Errorf("%w: homed %s", ErrUpToDate, u.Version)
+	}
+	if !allowDowngrade && older(rel.Version, u.Version) {
+		return nil, fmt.Errorf("%w: homed %s runs, the release is %s", ErrDowngrade, u.Version, rel.Version)
 	}
 	goos, goarch := u.GOOS, u.GOARCH
 	if goos == "" {

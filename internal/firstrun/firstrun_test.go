@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -115,7 +116,7 @@ func (t *terminal) String() string {
 	return t.buf.String()
 }
 
-var pinRe = regexp.MustCompile(`PIN (?:is )?(\d{6})`)
+var pinRe = regexp.MustCompile(`PIN (?:is now )?(\d{4} \d{4})`)
 
 // pins returns every PIN printed so far, in order.
 func (t *terminal) pins() []string {
@@ -151,7 +152,7 @@ func newEnv(t *testing.T) *env {
 	s.pollEvery, s.pingEvery = 5*time.Millisecond, 20*time.Millisecond
 	e.s, e.h = s, s.Handler()
 	// The PIN is printed by Serve; tests that use the handler directly print it here.
-	_, _ = io.WriteString(e.term, "test: PIN "+s.pin+"\n")
+	_, _ = io.WriteString(e.term, "test: PIN "+FormatPIN(s.pin)+"\n")
 	return e
 }
 
@@ -172,11 +173,14 @@ func (e *env) connected() {
 type browser struct {
 	e      *env
 	host   string
+	remote string // the device's address on the LAN
 	cookie string
 	header http.Header
 }
 
-func (e *env) browser() *browser { return &browser{e: e, host: lanHostPort, header: http.Header{}} }
+func (e *env) browser() *browser {
+	return &browser{e: e, host: lanHostPort, remote: "192.168.68.20:50000", header: http.Header{}}
+}
 
 func (b *browser) do(method, path string, body any) *httptest.ResponseRecorder {
 	b.e.t.Helper()
@@ -190,7 +194,7 @@ func (b *browser) do(method, path string, body any) *httptest.ResponseRecorder {
 	}
 	req := httptest.NewRequest(method, "http://"+b.host+path, rd)
 	req.Host = b.host
-	req.RemoteAddr = "192.168.68.20:50000"
+	req.RemoteAddr = b.remote
 	if rd != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
@@ -278,11 +282,13 @@ func TestPIN(t *testing.T) {
 	wantError(t, b.do(http.MethodPost, "/api/firstrun/link", map[string]any{}), http.StatusUnauthorized, "unauthenticated")
 	wantError(t, b.do(http.MethodGet, "/api/firstrun/events", nil), http.StatusUnauthorized, "unauthenticated")
 
-	wrong := "000000"
+	wrong := "0000 0000"
 	if e.pin() == wrong {
-		wrong = "111111"
+		wrong = "1111 1111"
 	}
 	wantError(t, b.do(http.MethodPost, "/api/firstrun/pin", map[string]string{"pin": wrong}), http.StatusUnauthorized, "wrong_pin")
+	// Six digits are never enough: the PIN has eight.
+	wantError(t, b.do(http.MethodPost, "/api/firstrun/pin", map[string]string{"pin": e.pin()[:6]}), http.StatusUnauthorized, "wrong_pin")
 	rec := b.do(http.MethodPost, "/api/firstrun/pin", map[string]string{"pin": " " + e.pin() + " "})
 	wantStatus(t, rec, http.StatusNoContent)
 	c := rec.Result().Cookies()[0]
@@ -307,45 +313,67 @@ func TestPIN(t *testing.T) {
 	}
 }
 
-func TestPINLockout(t *testing.T) {
-	e := newEnv(t)
-	b := e.browser()
-	first := e.pin()
-	wrong := func() string {
-		for _, p := range []string{"000000", "111111", "222222"} {
-			if p != e.pin() && p != first {
-				return p
-			}
+// wrongPIN returns a PIN that is not the current one.
+func (e *env) wrongPIN() string {
+	for _, p := range []string{"0000 0000", "1111 1111"} {
+		if p != e.pin() {
+			return p
 		}
-		t.Fatal("no wrong PIN")
-		return ""
-	}()
-	for range maxWrongPINs - 1 {
-		wantError(t, b.do(http.MethodPost, "/api/firstrun/pin", map[string]string{"pin": wrong}), http.StatusUnauthorized, "wrong_pin")
+	}
+	return ""
+}
+
+// One device that keeps guessing waits; the other devices on the LAN do not (review H2).
+func TestPINLockoutPerClient(t *testing.T) {
+	e := newEnv(t)
+	guesser := e.browser()
+	guesser.remote = "192.168.68.99:40000"
+	wrong := map[string]string{"pin": e.wrongPIN()}
+	for range maxWrongClient - 1 {
+		wantError(t, guesser.do(http.MethodPost, "/api/firstrun/pin", wrong), http.StatusUnauthorized, "wrong_pin")
 		e.clock.Add(time.Minute)
 	}
-	// The fifth wrong PIN prints a new one and locks the page until the first wrong one is 10 minutes old.
-	rec := b.do(http.MethodPost, "/api/firstrun/pin", map[string]string{"pin": wrong})
+	// The fifth wrong PIN locks this device until its first wrong one is 10 minutes old.
+	rec := guesser.do(http.MethodPost, "/api/firstrun/pin", wrong)
 	wantError(t, rec, http.StatusTooManyRequests, "rate_limited")
-	if got := rec.Header().Get("Retry-After"); got != strconv.Itoa(int((pinWindow - 4*time.Minute).Seconds())) {
+	if got := rec.Header().Get("Retry-After"); got != strconv.Itoa(int((clientWindow - 4*time.Minute).Seconds())) {
 		t.Fatalf("Retry-After %q", got)
 	}
-	if pins := e.term.pins(); len(pins) != 2 || pins[1] == "" {
+	// Locked: even the right PIN waits on this device, until Retry-After…
+	wantError(t, guesser.do(http.MethodPost, "/api/firstrun/pin", map[string]string{"pin": e.pin()}), http.StatusTooManyRequests, "rate_limited")
+	// …while the owner's phone signs in at once, and the PIN did not change under them.
+	if pins := e.term.pins(); len(pins) != 1 {
 		t.Fatalf("printed PINs %v", pins)
 	}
-	second := e.pin()
-	if second == first {
-		t.Skip("the new PIN repeated the old one (one in a million)")
+	e.browser().signIn()
+	e.clock.Add(clientWindow - 4*time.Minute)
+	guesser.signIn()
+}
+
+// 20 wrong PINs from anywhere close the page for good; only the CLI path is left (review H2).
+func TestPINFailureCapClosesThePage(t *testing.T) {
+	e := newEnv(t)
+	owner := e.browser()
+	owner.signIn()
+	wrong := map[string]string{"pin": e.wrongPIN()}
+	for i := range maxWrongTotal - 1 {
+		b := e.browser()
+		b.remote = "192.168.68." + strconv.Itoa(100+i) + ":40000" // a new address for every guess
+		wantError(t, b.do(http.MethodPost, "/api/firstrun/pin", wrong), http.StatusUnauthorized, "wrong_pin")
 	}
-	// Locked: even the new PIN waits, until Retry-After.
-	wantError(t, b.do(http.MethodPost, "/api/firstrun/pin", map[string]string{"pin": second}), http.StatusTooManyRequests, "rate_limited")
-	e.clock.Add(pinWindow - 4*time.Minute - time.Second)
-	wantError(t, b.do(http.MethodPost, "/api/firstrun/pin", map[string]string{"pin": second}), http.StatusTooManyRequests, "rate_limited")
-	e.clock.Add(time.Second)
-	b.signIn()
-	// The old PIN is dead.
-	e.clock.Add(pinWindow)
-	wantError(t, e.browser().do(http.MethodPost, "/api/firstrun/pin", map[string]string{"pin": first}), http.StatusUnauthorized, "wrong_pin")
+	last := e.browser()
+	last.remote = "192.168.68.200:40000"
+	wantError(t, last.do(http.MethodPost, "/api/firstrun/pin", wrong), http.StatusGone, "setup_closed")
+	if !e.s.isClosed() {
+		t.Fatal("the page is still open")
+	}
+	// Closed for everybody: the right PIN, a signed-in browser, the UI.
+	wantError(t, e.browser().do(http.MethodPost, "/api/firstrun/pin", map[string]string{"pin": e.pin()}), http.StatusGone, "setup_closed")
+	wantError(t, owner.do(http.MethodGet, "/api/firstrun/state", nil), http.StatusGone, "setup_closed")
+	rec := owner.do(http.MethodGet, "/firstrun", nil)
+	if rec.Code != http.StatusGone || !strings.Contains(rec.Body.String(), "homed admin firstrun") {
+		t.Fatalf("closed page: %d %s", rec.Code, rec.Body)
+	}
 }
 
 func TestRelayStep(t *testing.T) {
@@ -382,13 +410,27 @@ func TestRelayStep(t *testing.T) {
 	if st := decodeAs[state](t, b.do(http.MethodGet, "/api/firstrun/state", nil)); st.Relay.State != "offline" || st.Relay.LastError == "" {
 		t.Fatalf("state %+v", st.Relay)
 	}
-	e.relay.set(func(f *fakeRelay) { f.err = errors.New("disk full") })
-	wantError(t, b.do(http.MethodPost, "/api/firstrun/relay", map[string]string{"code": code}), http.StatusInternalServerError, "internal")
+	// A configured relay is never replaced from this page, whatever the domain (review M3).
+	other, _ := relay.FormatCode(relay.Code{Domain: "evil.example.com", Token: testToken})
+	for _, c := range []string{code, other} {
+		wantError(t, b.do(http.MethodPost, "/api/firstrun/relay", map[string]string{"code": c}), http.StatusConflict, "conflict")
+	}
+	if len(e.relay.codes) != 1 || e.relay.Domain() != testDomain {
+		t.Fatalf("Connect got %+v", e.relay.codes)
+	}
 
 	recs, _ := e.st.Audit().Query(context.Background(), store.AuditFilter{})
-	if len(recs) != 1 || recs[0].Action != "relay.change" || recs[0].Target != testDomain || strings.Contains(string(recs[0].Args), testToken) {
+	if len(recs) != 1 || recs[0].Action != "relay.change" || recs[0].Target != testDomain || strings.Contains(string(recs[0].Args), testToken) ||
+		string(recs[0].Args) != `{"client":"192.168.68.20"}` {
 		t.Fatalf("audit %+v", recs)
 	}
+
+	// A relay that fails to store its code answers 500 and changes nothing.
+	e2 := newEnv(t)
+	b2 := e2.browser()
+	b2.signIn()
+	e2.relay.set(func(f *fakeRelay) { f.err = errors.New("disk full") })
+	wantError(t, b2.do(http.MethodPost, "/api/firstrun/relay", map[string]string{"code": code}), http.StatusInternalServerError, "internal")
 }
 
 func TestLinkNeedsTheRelay(t *testing.T) {
@@ -422,19 +464,26 @@ func TestFirstRunEndToEnd(t *testing.T) {
 	b.signIn()
 	e.connected()
 
+	pin := e.pin()
 	rec := b.do(http.MethodPost, "/api/firstrun/link", map[string]any{})
 	wantStatus(t, rec, http.StatusOK)
 	first := decodeAs[map[string]string](t, rec)
+	// Every issued link changes the PIN (review H2): a PIN seen on the LAN cannot fetch the next one.
+	if pins := e.term.pins(); len(pins) != 2 || pins[1] == pin {
+		t.Fatalf("PINs after a link %v", pins)
+	}
+	wantError(t, e.browser().do(http.MethodPost, "/api/firstrun/pin", map[string]string{"pin": pin}), http.StatusUnauthorized, "wrong_pin")
 	rec = b.do(http.MethodPost, "/api/firstrun/link", map[string]any{}) // "Новая ссылка" revokes the first
 	wantStatus(t, rec, http.StatusOK)
 	link := decodeAs[map[string]string](t, rec)
 	prefix := "https://" + testDomain + "/admin/setup#t="
+	// A link from this page lives 3 minutes (review M2).
 	if !strings.HasPrefix(link["url"], prefix) || link["url"] == first["url"] ||
-		link["expiresAt"] != e.clock.Now().Add(auth.SetupLinkTTL).UTC().Format("2006-01-02T15:04:05.000Z") {
+		link["expiresAt"] != e.clock.Now().Add(LinkTTL).UTC().Format("2006-01-02T15:04:05.000Z") {
 		t.Fatalf("link %v", link)
 	}
 	recs, _ := e.st.Audit().Query(ctx, store.AuditFilter{})
-	if len(recs) != 2 || recs[0].Action != "setup.link" || recs[0].Via != "admin" {
+	if len(recs) != 2 || recs[0].Action != "setup.link" || recs[0].Via != "admin" || string(recs[0].Args) != `{"client":"192.168.68.20"}` {
 		t.Fatalf("audit %+v", recs)
 	}
 
@@ -487,7 +536,11 @@ func TestFirstRunEndToEnd(t *testing.T) {
 	if !strings.Contains(rec.Body.String(), "Дом уже настроен") || rec.Header().Get("Content-Type") != "text/html; charset=utf-8" {
 		t.Fatalf("done page %s", rec.Body)
 	}
-	if needed, err := Needed(ctx, e.st); err != nil || needed {
+	// Only passkeys of the current relying party count (review L4): for another relay domain the page is needed again.
+	if needed, err := Needed(ctx, e.st, "other.example.com"); err != nil || !needed {
+		t.Fatalf("Needed for another domain %v %v", needed, err)
+	}
+	if needed, err := Needed(ctx, e.st, testDomain); err != nil || needed {
 		t.Fatalf("Needed %v %v", needed, err)
 	}
 }
@@ -658,19 +711,122 @@ func TestServe(t *testing.T) {
 	if res.StatusCode != http.StatusOK {
 		t.Fatalf("status %d", res.StatusCode)
 	}
-	s.mu.Lock()
-	pin := s.pin
-	s.mu.Unlock()
+	pin, until := s.PIN()
 	out := term.String()
-	if !strings.Contains(out, "http://"+ln.Addr().String()+"/firstrun") || len(term.pins()) != 1 || term.pins()[0] != pin {
+	if !strings.Contains(out, "http://"+ln.Addr().String()+"/firstrun") || len(term.pins()) != 1 || term.pins()[0] != FormatPIN(pin) ||
+		!strings.Contains(out, "closes at") {
 		t.Fatalf("terminal %q", out)
+	}
+	if closes := s.ClosesAt(); closes.Sub(until) != OpenFor-PINEvery {
+		t.Fatalf("closes %v, PIN until %v", closes, until)
 	}
 	cancel()
 	if err := <-done; err != nil {
 		t.Fatal(err)
 	}
-	if urls := pageURLs(&net.TCPAddr{IP: net.IPv4zero, Port: 8090}); len(urls) == 0 || urls[len(urls)-1] != "http://localhost:8090/firstrun" {
+	if urls := PageURLs(&net.TCPAddr{IP: net.IPv4zero, Port: 8090}); len(urls) == 0 || urls[len(urls)-1] != "http://localhost:8090/firstrun" {
 		t.Fatalf("urls %v", urls)
+	}
+}
+
+// serveBriefly runs Serve with short timings and returns a function that waits for it to end.
+func serveBriefly(t *testing.T, s *Server) (addr string, wait func() error) {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- s.Serve(ctx, ln) }()
+	t.Cleanup(cancel)
+	return ln.Addr().String(), func() error {
+		select {
+		case err := <-done:
+			return err
+		case <-time.After(10 * time.Second):
+			t.Fatal("Serve did not return")
+			return nil
+		}
+	}
+}
+
+// The page closes by itself after its time; the PIN changes on a timer meanwhile (review H2).
+func TestServeClosesAndRotates(t *testing.T) {
+	term := &terminal{}
+	logs := &terminal{}
+	s, err := New(Options{Store: authtest.New(), Relay: &fakeRelay{}, Terminal: term, OpenFor: 300 * time.Millisecond,
+		Log: slog.New(slog.NewTextHandler(logs, nil))})
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.pinEvery = 40 * time.Millisecond
+	addr, wait := serveBriefly(t, s)
+	if err := wait(); err != nil {
+		t.Fatal(err)
+	}
+	if pins := term.pins(); len(pins) < 3 || pins[0] == pins[len(pins)-1] {
+		t.Fatalf("PINs %v", pins)
+	}
+	if !strings.Contains(term.String(), "homed admin firstrun") || !strings.Contains(logs.String(), "first-run page closed") {
+		t.Fatalf("terminal %q, log %q", term, logs)
+	}
+	if _, err := net.DialTimeout("tcp", addr, time.Second); err == nil {
+		t.Fatal("the port is still open")
+	}
+}
+
+// Too many wrong PINs close the listener too, not only the answers.
+func TestServeClosesAfterTheCap(t *testing.T) {
+	s, err := New(Options{Store: authtest.New(), Relay: &fakeRelay{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr, wait := serveBriefly(t, s)
+	s.mu.Lock()
+	s.wrongTotal = maxWrongTotal - 1
+	s.mu.Unlock()
+	req, _ := http.NewRequestWithContext(context.Background(), http.MethodPost, "http://"+addr+"/api/firstrun/pin",
+		strings.NewReader(`{"pin":"00000000"}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-GPT-Home", "1")
+	res, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = res.Body.Close()
+	if res.StatusCode != http.StatusGone {
+		t.Fatalf("status %d", res.StatusCode)
+	}
+	if err := wait(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// Without a terminal (launchd, systemd) the PIN is never printed or logged; the log says how to get in (review H2).
+func TestNoTerminalNoPIN(t *testing.T) {
+	logs := &terminal{}
+	s, err := New(Options{Store: authtest.New(), Relay: &fakeRelay{}, OpenFor: 100 * time.Millisecond,
+		Log: slog.New(slog.NewTextHandler(logs, nil))})
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.pinEvery = 20 * time.Millisecond
+	_, wait := serveBriefly(t, s)
+	if err := wait(); err != nil {
+		t.Fatal(err)
+	}
+	out := logs.String()
+	pin, _ := s.PIN()
+	if strings.Contains(out, pin) || strings.Contains(out, FormatPIN(pin)) || !strings.Contains(out, "homed admin firstrun") ||
+		!strings.Contains(out, "homed admin setup-link") {
+		t.Fatalf("log %q", out)
+	}
+}
+
+func TestDefaultListen(t *testing.T) {
+	if DefaultListen(false) != "0.0.0.0:8090" || DefaultListen(true) != "127.0.0.1:8090" {
+		t.Fatal(DefaultListen(false), DefaultListen(true))
 	}
 }
 
@@ -681,12 +837,15 @@ func TestNew(t *testing.T) {
 	seen := map[string]bool{}
 	for range 50 {
 		p := newPIN()
-		if len(p) != 6 || strings.Trim(p, "0123456789") != "" {
+		if len(p) != 8 || strings.Trim(p, "0123456789") != "" {
 			t.Fatalf("PIN %q", p)
 		}
 		seen[p] = true
 	}
-	if len(seen) < 45 {
+	if len(seen) < 49 {
 		t.Fatalf("PINs repeat: %d distinct of 50", len(seen))
+	}
+	if FormatPIN("12345678") != "1234 5678" {
+		t.Fatal(FormatPIN("12345678"))
 	}
 }

@@ -1,6 +1,7 @@
 package install
 
 import (
+	"archive/tar"
 	"context"
 	"errors"
 	"os"
@@ -140,6 +141,16 @@ func TestInstallRefusals(t *testing.T) {
 			b := makeTarGz(t, []tarEntry{{name: "README.md", body: "x"}})
 			r.files = map[string][]byte{ArchiveName("gpt-tv", "0.2.0", "linux", "arm64"): b}
 		}, ErrBadManifest, "upstream", ""},
+		// The review's chain: the stored manifest would have been written through the links, outside the plugin dir.
+		{"manifest symlink through a chain", func(t *testing.T, r *fakeRelease) {
+			b := makeTarGz(t, []tarEntry{
+				{name: "gpt-tv", body: script, mode: 0o755},
+				{name: "a/b/c/", typ: tar.TypeDir},
+				{name: "a/b/c/up", typ: tar.TypeSymlink, target: "../../.."},
+				{name: ManifestAsset, typ: tar.TypeSymlink, target: "a/b/c/up/../escaped"},
+			})
+			r.files = map[string][]byte{ArchiveName("gpt-tv", "0.2.0", "linux", "arm64"): b}
+		}, ErrUnsafeArchive, "upstream", ""},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -234,7 +245,7 @@ func TestUpdateSuccessPrunesOldVersions(t *testing.T) {
 	if _, err := inst.Install(ctx, "devXpro/gpt-tv", "0.1.0", "tv", nil); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := inst.Update(ctx, "tv", "devXpro/gpt-tv", "0.1.0", "0.2.0", nil); err != nil {
+	if _, err := inst.Update(ctx, "tv", "devXpro/gpt-tv", "0.1.0", "0.2.0", false, nil); err != nil {
 		t.Fatal(err)
 	}
 	if got := versionsOnDisk(t, inst); !slices.Equal(got, []string{"0.1.0", "0.2.0"}) {
@@ -242,7 +253,7 @@ func TestUpdateSuccessPrunesOldVersions(t *testing.T) {
 	}
 
 	rec := &recorder{}
-	next, err := inst.Update(ctx, "tv", "devXpro/gpt-tv", "0.2.0", "latest", rec.hooks())
+	next, err := inst.Update(ctx, "tv", "devXpro/gpt-tv", "0.2.0", "latest", false, rec.hooks())
 	if err != nil || next.Version != "0.3.0" {
 		t.Fatalf("update: %+v %v", next, err)
 	}
@@ -268,7 +279,7 @@ func TestUpdateRollsBackWhenStartFails(t *testing.T) {
 		t.Fatal(err)
 	}
 	rec := &recorder{startErr: errors.New("plugin exited with status 2")}
-	_, err := inst.Update(ctx, "tv", "devXpro/gpt-tv", "0.1.0", "", rec.hooks())
+	_, err := inst.Update(ctx, "tv", "devXpro/gpt-tv", "0.1.0", "", false, rec.hooks())
 	if !errors.Is(err, ErrStartFailed) || !errors.Is(err, ErrRolledBack) || Code(err) != "rolled_back" {
 		t.Fatalf("err = %v (%s)", err, Code(err))
 	}
@@ -292,7 +303,7 @@ func TestUpdateRollbackFailureKeepsFiles(t *testing.T) {
 		t.Fatal(err)
 	}
 	rec := &recorder{startErr: errors.New("boom"), rollErr: errors.New("store down")}
-	_, err := inst.Update(t.Context(), "tv", "devXpro/gpt-tv", "0.1.0", "", rec.hooks())
+	_, err := inst.Update(t.Context(), "tv", "devXpro/gpt-tv", "0.1.0", "", false, rec.hooks())
 	if !errors.Is(err, ErrStartFailed) || errors.Is(err, ErrRolledBack) || Code(err) != "start_failed" {
 		t.Fatalf("err = %v (%s)", err, Code(err))
 	}
@@ -310,7 +321,7 @@ func TestUpdateSwitchFailureAborts(t *testing.T) {
 		t.Fatal(err)
 	}
 	rec := &recorder{switchErr: errors.New("db locked")}
-	if _, err := inst.Update(t.Context(), "tv", "devXpro/gpt-tv", "0.1.0", "", rec.hooks()); err == nil {
+	if _, err := inst.Update(t.Context(), "tv", "devXpro/gpt-tv", "0.1.0", "", false, rec.hooks()); err == nil {
 		t.Fatal("expected error")
 	}
 	if len(rec.started) != 0 || len(rec.rolled) != 0 {
@@ -325,14 +336,52 @@ func TestUpdateRefusals(t *testing.T) {
 	f := newFakeGitHub(t)
 	f.add("devXpro/gpt-tv", tvRelease(t, "0.1.0"))
 	inst := newTestInstaller(t, f)
-	if _, err := inst.Update(t.Context(), "tv", "devXpro/gpt-tv", "0.1.0", "", nil); !errors.Is(err, ErrUpToDate) || Code(err) != "up_to_date" {
+	if _, err := inst.Update(t.Context(), "tv", "devXpro/gpt-tv", "0.1.0", "", false, nil); !errors.Is(err, ErrUpToDate) || Code(err) != "up_to_date" {
 		t.Fatalf("same version: %v", err)
 	}
-	if _, err := inst.Update(t.Context(), "kettle", "devXpro/gpt-tv", "0.0.1", "", nil); !errors.Is(err, ErrIDMismatch) {
+	if _, err := inst.Update(t.Context(), "kettle", "devXpro/gpt-tv", "0.0.1", "", false, nil); !errors.Is(err, ErrIDMismatch) {
 		t.Fatalf("id mismatch: %v", err)
 	}
-	if _, err := inst.Update(t.Context(), "../x", "devXpro/gpt-tv", "0.0.1", "", nil); err == nil {
+	if _, err := inst.Update(t.Context(), "../x", "devXpro/gpt-tv", "0.0.1", "", false, nil); err == nil {
 		t.Fatal("bad id accepted")
+	}
+}
+
+// An older release is a downgrade, named or as "latest" (a newer release was pulled), and needs explicit permission.
+func TestUpdateRefusesDowngrade(t *testing.T) {
+	f := newFakeGitHub(t)
+	f.add("devXpro/gpt-tv", tvRelease(t, "0.1.0"))
+	f.add("devXpro/gpt-tv", tvRelease(t, "0.2.0"))
+	inst := newTestInstaller(t, f)
+	ctx := t.Context()
+	if _, err := inst.Install(ctx, "devXpro/gpt-tv", "0.2.0", "tv", nil); err != nil {
+		t.Fatal(err)
+	}
+	for _, version := range []string{"0.1.0", "v0.1.0"} {
+		rec := &recorder{}
+		_, err := inst.Update(ctx, "tv", "devXpro/gpt-tv", "0.2.0", version, false, rec.hooks())
+		if !errors.Is(err, ErrDowngrade) || Code(err) != "downgrade" {
+			t.Fatalf("%s: err = %v (%s)", version, err, Code(err))
+		}
+		if len(rec.switched) != 0 || len(rec.started) != 0 {
+			t.Fatalf("%s: hooks ran: %+v", version, rec)
+		}
+	}
+	// "latest" resolving to an older release (installed 0.3.0 was pulled from GitHub) is a downgrade too.
+	if _, err := inst.Update(ctx, "tv", "devXpro/gpt-tv", "0.3.0", "latest", false, nil); !errors.Is(err, ErrDowngrade) {
+		t.Fatalf("latest older than installed: %v", err)
+	}
+	if got := versionsOnDisk(t, inst); !slices.Equal(got, []string{"0.2.0"}) {
+		t.Fatalf("disk after refused downgrades: %v", got)
+	}
+	// Allowed explicitly, it goes through.
+	next, err := inst.Update(ctx, "tv", "devXpro/gpt-tv", "0.2.0", "0.1.0", true, nil)
+	if err != nil || next.Version != "0.1.0" {
+		t.Fatalf("allowed downgrade: %+v %v", next, err)
+	}
+	// A development build or an unknown version has nothing to go back from.
+	if older("0.1.0", "") || older("0.1.0", "dev") || !older("0.1.0", "0.2.0") || older("0.2.0", "0.1.0") {
+		t.Fatal("older() is wrong")
 	}
 }
 

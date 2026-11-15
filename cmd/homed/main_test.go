@@ -38,6 +38,16 @@ func cli(t *testing.T, stdin string, args ...string) (stdout, stderr string, err
 	return out.String(), errOut.String(), err
 }
 
+// connectRelay runs `homed relay connect -` with a code for homie.test on stdin and returns its stdout.
+func connectRelay(t *testing.T, dir string) string {
+	t.Helper()
+	out, errOut, err := cli(t, testCode(t, "homie.test")+"\n", "relay", "connect", "-", "--data-dir", dir)
+	if err != nil {
+		t.Fatalf("homed relay connect -: %v\nstdout: %s\nstderr: %s", err, out, errOut)
+	}
+	return out
+}
+
 func mustCLI(t *testing.T, args ...string) string {
 	t.Helper()
 	out, errOut, err := cli(t, "", args...)
@@ -183,8 +193,8 @@ func TestRelayConnectOffline(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "data")
 	writeFile(t, filepath.Join(dir, config.FileName), "# my relay\nlisten: 127.0.0.1:8080 # loopback\n")
 
-	// The code goes first and the flag after it, as people type it.
-	out, errOut, err := cli(t, "", "relay", "connect", testCode(t, "homie.test"), "--data-dir", dir)
+	// "-" goes first and the flag after it, as people type it; the code comes on stdin.
+	out, errOut, err := cli(t, testCode(t, "homie.test")+"\n", "relay", "connect", "-", "--data-dir", dir)
 	if err != nil {
 		t.Fatalf("%v; stderr %s", err, errOut)
 	}
@@ -231,15 +241,21 @@ func TestRelayConnectErrors(t *testing.T) {
 		args []string
 	}{
 		{"no code", []string{"relay", "connect", "--data-dir", dir}},
-		{"bad code", []string{"relay", "connect", "--data-dir", dir, "ghr1.zzz"}},
-		{"extra args", []string{"relay", "connect", "--data-dir", dir, testCode(t, "a.test"), "extra"}},
+		{"bad code", []string{"relay", "connect", "--data-dir", dir, "-"}},
+		{"extra args", []string{"relay", "connect", "--data-dir", dir, "-", "extra"}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if _, _, err := cli(t, "", tt.args...); err == nil {
+			if _, _, err := cli(t, "ghr1.zzz\n", tt.args...); err == nil {
 				t.Fatal("want an error")
 			}
 		})
+	}
+	// A code on the command line is refused, a valid one too, and the error never repeats it (review L10).
+	code := testCode(t, "a.test")
+	out, errOut, err := cli(t, "", "relay", "connect", code, "--data-dir", dir)
+	if !errors.Is(err, errCodeInArgv) || strings.Contains(err.Error()+out+errOut, code) || !strings.Contains(err.Error(), "relay connect -") {
+		t.Fatalf("code in argv: %v %q %q", err, out, errOut)
 	}
 	if _, err := os.Stat(filepath.Join(dir, config.RelayTokenFile)); !os.IsNotExist(err) {
 		t.Fatal("a failed connect wrote the token")
@@ -248,7 +264,7 @@ func TestRelayConnectErrors(t *testing.T) {
 
 func TestCommandsNeedRunningHomed(t *testing.T) {
 	dir := t.TempDir()
-	for _, args := range [][]string{{"relay", "status"}, {"tool", "list"}, {"tool", "call", "x_y"}} {
+	for _, args := range [][]string{{"relay", "status"}, {"tool", "list"}, {"tool", "call", "x_y"}, {"admin", "firstrun"}} {
 		_, _, err := cli(t, "", append(args, "--data-dir", dir)...)
 		if !errors.Is(err, errNotRunning) {
 			t.Errorf("homed %v: err = %v", args, err)
@@ -331,7 +347,7 @@ func TestOfflineCommands(t *testing.T) {
 	if _, _, err := cli(t, "", "admin", "setup-link", "--data-dir", dir); err == nil || !strings.Contains(err.Error(), "relay") {
 		t.Fatalf("setup-link without a relay: %v", err)
 	}
-	mustCLI(t, "relay", "connect", testCode(t, "homie.test"), "--data-dir", dir)
+	connectRelay(t, dir)
 	out, errOut, err = cli(t, "", "admin", "setup-link", "--data-dir", dir)
 	if err != nil || !strings.HasPrefix(out, "https://homie.test/admin/setup#t=") || strings.Count(out, "\n") != 1 ||
 		!strings.Contains(errOut, "works once") {

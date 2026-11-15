@@ -84,6 +84,10 @@ func TestRoutes(t *testing.T) {
 			if rec.Header().Get("X-Content-Type-Options") != "nosniff" {
 				t.Errorf("missing nosniff")
 			}
+			// HSTS on every answer, the 404s and the not-built 503 included (review L11).
+			if rec.Header().Get("Strict-Transport-Security") != "max-age=31536000" {
+				t.Errorf("Strict-Transport-Security = %q", rec.Header().Get("Strict-Transport-Security"))
+			}
 		})
 	}
 }
@@ -177,8 +181,9 @@ func TestAcceptsGzip(t *testing.T) {
 func TestNotBuilt(t *testing.T) {
 	h := New(fstest.MapFS{".gitkeep": {Data: nil}})
 	rec := get(t, h, http.MethodGet, "/admin", nil)
-	if rec.Code != http.StatusServiceUnavailable || !strings.Contains(rec.Body.String(), "make web") {
-		t.Fatalf("status %d, body %q", rec.Code, rec.Body.String())
+	if rec.Code != http.StatusServiceUnavailable || !strings.Contains(rec.Body.String(), "make web") ||
+		rec.Header().Get("Strict-Transport-Security") == "" {
+		t.Fatalf("status %d, body %q, headers %v", rec.Code, rec.Body.String(), rec.Header())
 	}
 }
 

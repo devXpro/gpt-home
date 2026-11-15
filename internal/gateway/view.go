@@ -8,6 +8,7 @@ import (
 	"hash/fnv"
 	"net/http"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 
@@ -135,11 +136,13 @@ func present(raw json.RawMessage) json.RawMessage {
 	return raw
 }
 
-// instructions is the hub preamble plus the plugins' own instructions (§5.4). g.mu is held.
+// instructions is the hub preamble plus the plugins' own instructions (§5.4). g.mu is held. The home name is the
+// owner's text: it goes in as a quoted string (strconv.Quote), so a quote or a line break in it can never end the
+// name and read as an instruction of its own. The admin refuses such names anyway (wire.CheckName).
 func (g *gateway) instructions() string {
 	home := "the user's home"
 	if g.opts.HomeName != "" {
-		home = `the home "` + g.opts.HomeName + `"`
+		home = "the home " + strconv.Quote(g.opts.HomeName)
 	}
 	text := "These tools control devices in " + home + ". Act only when the user asks. After acting, confirm what " +
 		"was done in one short sentence. If a device is offline or a tool fails, say so plainly and never claim it worked."

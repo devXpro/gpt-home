@@ -32,6 +32,8 @@ var (
 	ErrRolledBack = errors.New("install: rolled back to the previous version")
 	// ErrUpToDate means the requested version is already installed.
 	ErrUpToDate = errors.New("install: already up to date")
+	// ErrDowngrade means the release is older than the installed version and the caller did not allow a downgrade.
+	ErrDowngrade = errors.New("install: the release is older than the installed version")
 	// ErrIDMismatch means the requested plugin id differs from the manifest's.
 	ErrIDMismatch = errors.New("install: plugin id does not match the manifest")
 	// ErrNotWritable means the running binary cannot be replaced (for example a package manager owns it).
@@ -39,12 +41,14 @@ var (
 )
 
 // Code maps an error to the job error codes of ADMIN-API (checksum_mismatch, no_asset, incompatible, start_failed,
-// rolled_back, upstream, internal) plus not_found and up_to_date. Unknown errors are "internal". Callers should
-// put err.Error() in the job's message: it never contains a token.
+// rolled_back, downgrade, upstream, internal) plus not_found and up_to_date. Unknown errors are "internal". Callers
+// should put err.Error() in the job's message: it never contains a token.
 func Code(err error) string {
 	switch {
 	case err == nil:
 		return ""
+	case errors.Is(err, ErrDowngrade):
+		return "downgrade"
 	case errors.Is(err, ErrRolledBack):
 		return "rolled_back"
 	case errors.Is(err, ErrStartFailed):

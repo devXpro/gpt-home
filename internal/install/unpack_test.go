@@ -47,7 +47,15 @@ func TestUnpackRefusesUnsafeArchives(t *testing.T) {
 		{"absolute symlink", []tarEntry{{name: "l", typ: tar.TypeSymlink, target: "/etc/passwd"}}, Limits{}, ErrUnsafeArchive},
 		{"escaping symlink", []tarEntry{{name: "l", typ: tar.TypeSymlink, target: "../outside"}}, Limits{}, ErrUnsafeArchive},
 		{"nested escaping symlink", []tarEntry{{name: "a/b/l", typ: tar.TypeSymlink, target: "../../../outside"}}, Limits{}, ErrUnsafeArchive},
+		{"symlink inside", []tarEntry{{name: "bin/tool", body: "x"}, {name: "link", typ: tar.TypeSymlink, target: "bin/tool"}}, Limits{}, ErrUnsafeArchive},
+		// Each link on its own resolves inside dest lexically; together they point above it (the review's chain).
+		{"chained symlinks", []tarEntry{
+			{name: "a/b/c/", typ: tar.TypeDir},
+			{name: "a/b/c/up", typ: tar.TypeSymlink, target: "../../.."},
+			{name: "gpt-home-plugin.json", typ: tar.TypeSymlink, target: "a/b/c/up/../escaped"},
+		}, Limits{}, ErrUnsafeArchive},
 		{"hard link", []tarEntry{{name: "h", typ: tar.TypeLink, target: "../outside"}}, Limits{}, ErrUnsafeArchive},
+		{"hard link inside", []tarEntry{{name: "a", body: "x"}, {name: "h", typ: tar.TypeLink, target: "a"}}, Limits{}, ErrUnsafeArchive},
 		{"device", []tarEntry{{name: "d", typ: tar.TypeChar}}, Limits{}, ErrUnsafeArchive},
 		{"fifo", []tarEntry{{name: "f", typ: tar.TypeFifo}}, Limits{}, ErrUnsafeArchive},
 		{"duplicate", []tarEntry{{name: "a", body: "1"}, {name: "a", body: "2"}}, Limits{}, ErrUnsafeArchive},
@@ -71,18 +79,22 @@ func TestUnpackRefusesUnsafeArchives(t *testing.T) {
 	}
 }
 
-// A symlink that is fine on its own must not let a later entry write through it to the outside.
+// A symlink that is fine on its own is refused too, so no later entry can write through it to the outside.
 func TestUnpackWritesCannotFollowSymlinkOut(t *testing.T) {
 	data := makeTarGz(t, []tarEntry{
 		{name: "sub/", typ: tar.TypeDir},
-		{name: "sub/up", typ: tar.TypeSymlink, target: ".."}, // resolves to dest itself: allowed
+		{name: "sub/up", typ: tar.TypeSymlink, target: ".."}, // resolves to dest itself
 		{name: "sub/up/up/evil", body: "x"},                  // would resolve to outer/ if followed twice
 	})
-	outer, _, err := unpackInto(t, data, Limits{})
-	if err == nil {
-		if _, statErr := os.Stat(filepath.Join(outer, "evil")); statErr == nil {
-			t.Fatal("a write escaped through a symlink")
-		}
+	outer, dest, err := unpackInto(t, data, Limits{})
+	if !errors.Is(err, ErrUnsafeArchive) {
+		t.Fatalf("err = %v, want ErrUnsafeArchive", err)
+	}
+	if _, statErr := os.Stat(filepath.Join(outer, "evil")); statErr == nil {
+		t.Fatal("a write escaped through a symlink")
+	}
+	if _, statErr := os.Lstat(filepath.Join(dest, "sub", "up")); statErr == nil {
+		t.Fatal("the symlink was created")
 	}
 }
 
@@ -105,7 +117,6 @@ func TestUnpackNormalizesModes(t *testing.T) {
 		{name: "./", typ: tar.TypeDir},
 		{name: "./bin/tool", body: "x", mode: 0o4755}, // setuid is dropped
 		{name: "plain", body: "y", mode: 0o666},
-		{name: "link", typ: tar.TypeSymlink, target: "bin/tool"},
 	})
 	_, dest, err := unpackInto(t, data, Limits{})
 	if err != nil {
@@ -117,8 +128,50 @@ func TestUnpackNormalizesModes(t *testing.T) {
 			t.Fatalf("%s: %v %v, want %v", name, fi, err, want)
 		}
 	}
-	if fi, err := os.Lstat(filepath.Join(dest, "link")); err != nil || fi.Mode()&os.ModeSymlink == 0 {
-		t.Fatalf("symlink inside the target must be kept: %v %v", fi, err)
+}
+
+// The released manifest is written through os.Root and never through a name the archive left behind.
+func TestWriteManifest(t *testing.T) {
+	released := []byte(`{"id":"tv","binary":"gpt-tv"}`)
+	dir := t.TempDir()
+	if err := writeManifest(dir, released); err != nil {
+		t.Fatal(err)
+	}
+	if got := readFile(t, filepath.Join(dir, ManifestAsset)); got != string(released) {
+		t.Fatalf("manifest = %q", got)
+	}
+	// The archive's own copy is replaced by the released one.
+	if err := os.WriteFile(filepath.Join(dir, ManifestAsset), []byte(`{"id":"evil"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeManifest(dir, released); err != nil {
+		t.Fatal(err)
+	}
+	if got := readFile(t, filepath.Join(dir, ManifestAsset)); got != string(released) {
+		t.Fatalf("manifest after an archive copy = %q", got)
+	}
+	// A symlink in its place (were one ever to get there) is refused, and its target stays untouched.
+	outside := filepath.Join(t.TempDir(), "outside")
+	if err := os.WriteFile(outside, []byte("keep"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	linked := t.TempDir()
+	if err := os.Symlink(outside, filepath.Join(linked, ManifestAsset)); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeManifest(linked, released); !errors.Is(err, ErrUnsafeArchive) {
+		t.Fatalf("symlinked manifest: err = %v", err)
+	}
+	if got := readFile(t, outside); got != "keep" {
+		t.Fatalf("the link target was written: %q", got)
+	}
+	// So is a directory of that name.
+	withDir := t.TempDir()
+	if err := os.Mkdir(filepath.Join(withDir, ManifestAsset), 0o750); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeManifest(withDir, released); !errors.Is(err, ErrUnsafeArchive) {
+		t.Fatalf("directory manifest: err = %v", err)
 	}
 }
 

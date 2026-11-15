@@ -50,8 +50,9 @@ Every error has this body:
 | 404 | `token_invalid` | setup or invite token not known |
 | 404 | `no_inventory` | the plugin has no inventory tool |
 | 405 | `method_not_allowed` | |
-| 409 | `conflict` | generic duplicate (id taken, name taken) |
-| 409 | `last_passkey` | removing the person's only passkey |
+| 409 | `conflict` | generic duplicate (id taken, name taken); first run: homed already has a relay |
+| 409 | `downgrade` | an update to a version older than the installed one (plugin or hub) without `allowDowngrade` on the socket |
+| 409 | `last_passkey` | removing the person's only passkey that can still sign in (one of the current relay domain) |
 | 409 | `passkey_exists` | this authenticator is already registered |
 | 409 | `call_running` | the same tool already has a running admin call; body adds `"callId"` |
 | 409 | `job_running` | a job of the same kind and target is running; body adds `"jobId"` |
@@ -60,6 +61,7 @@ Every error has this body:
 | 409 | `domain_change_local_only` | a relay code for another domain sent from the web (§3.9) |
 | 410 | `token_expired` / `token_used` | setup or invite token past its time, or already consumed |
 | 410 | `setup_done` | first-run LAN page after an owner exists |
+| 410 | `setup_closed` | first-run LAN page closed: 30 minutes passed or 20 wrong PINs; `homed admin firstrun` opens it again |
 | 413 | `too_large` | body over the limit |
 | 415 | `unsupported_media_type` | |
 | 422 | `tool_failed` | a synchronous tool read (inventory) ran and reported `isError`; `message` is the plugin's text |
@@ -115,14 +117,26 @@ Lists that can grow (the audit log) are cursor-paged:
 Short lists (plugins, passkeys, people, keys, sessions) are returned whole as `{"items":[…]}`.
 
 ### 1.7 Rate limits
+Every class has buckets of its own, so spending one never locks another (T2.F): an anonymous flood can neither stop
+the owner's sign-in from their own address nor a signed-in owner's step-up.
+
 | Scope | Limit |
 |---|---|
-| `auth/*` begin and finish, `auth/token` | 20 per minute per client address, 60 per minute in total |
-| first-run PIN | 5 wrong PINs per 10 minutes, then the PIN is rotated and printed again |
+| `auth/token`, `auth/register/begin`, `auth/register/finish` | every request: 20 per minute per client address, 60 per minute in total |
+| `auth/login/begin`, `auth/login/finish` | per client address: 30 begins and 10 failed finishes per minute; no shared bucket |
+| `auth/stepup/*`; `me/passkeys/begin`, `me/passkeys/finish` | per session, each its own: 30 begins and 10 failed finishes per minute |
+| first-run PIN | per device (LAN address): 5 wrong PINs per 10 minutes; 20 wrong PINs from anyone close the page (`410 setup_closed`) |
 | every other admin request | 600 per minute per session |
 
-The client address: homed only sees `127.0.0.1` from frpc. T2.2 derives it from the `X-Forwarded-For` hop that Caddy
-appended (never the left-most, client-controlled values) and falls back to the global bucket when it cannot.
+- A failed finish is one whose passkey or ceremony did not verify (`webauthn_failed`, `login_failed`); successful
+  finishes cost nothing. While a key's failures are spent, its begins and finishes both answer `429`.
+- Pending ceremonies: at most 1000 public ones (register, login; a new one replaces the oldest when full) and 1000 of
+  sessions (step-up, another passkey), so public traffic never crowds out a step-up.
+- The client address: homed only sees `127.0.0.1` from frpc. It takes the second-to-last `X-Forwarded-For` hop: the
+  one Caddy appended (Caddy replaces any value a client sends), followed by the one frps appended (Caddy's). The
+  left-most, client-controlled values are never used. A CDN or another proxy in front of Caddy would turn that hop
+  into the proxy's address (docs/SECURITY.md). IPv6 clients count per /64. A request without the two hops (loopback,
+  development, a local tool) has a bucket of its own, outside the totals, never the internet's.
 
 ## 2. Objects
 
@@ -232,7 +246,9 @@ Every object below is the exact JSON shape; `?` marks an optional (omitted when 
 
 `state` ∈ `running|ok|failed`. Job error codes: `checksum_mismatch`, `no_asset` (no build for this OS and CPU),
 `incompatible` (`minHubVersion` too high), `start_failed` (the new version did not come up; for updates the old one
-is back: `rolled_back`), `upstream`, `internal`. Finished jobs are kept for 1 hour (at most 50).
+is back: `rolled_back`), `downgrade` (the release, "latest" included, is older than the installed version),
+`job_running` (another install, update or removal of the same plugin holds it), `upstream`, `internal`. Finished jobs
+are kept for 1 hour (at most 50).
 
 **AuditItem**
 ```json
@@ -278,7 +294,8 @@ Paths in §3, §4 and §6 are relative to `/api/admin` (`GET /plugins` = `GET /a
 | `GET /bootstrap` | public | — | `200 {"homeName":"Мой шалаш","language":"ru","ownerReady":true,"features":{"people":false,"connections":false},"connectionKind?":"site"}` |
 | `GET /session` | session | — | `200 Me`; `401 unauthenticated` |
 
-- `ownerReady` = an owner with at least one passkey exists. When false, the login screen says how to finish the setup.
+- `ownerReady` = an owner with at least one passkey of the current relay domain (the WebAuthn RP ID) exists; passkeys
+  of an old domain cannot sign in and do not count. When false, the login screen says how to finish the setup.
 - `bootstrap` reveals the home name and nothing else; no version, no people.
 
 ### 3.2 Passkey ceremonies (`/auth`)
@@ -308,8 +325,11 @@ Register rules:
 - `token` is a setup link (`kind: "setup"`) or an invite (`kind: "member"`, [P3]). It is checked at `begin` and
   consumed at `finish`, inside one `store.InTx` with: creating the person (or using the one the token names), storing
   the passkey, saving `homeName` (setup only) and creating the session.
-- `personName` and `homeName` are used only with a setup token; 1–40 characters after trimming. Without them, the
-  existing person name and home name stay.
+- `personName` and `homeName` are used only with a setup token. Without them, the existing person name and home name
+  stay.
+- Every display name (person, home, passkey; here and in `PATCH /me`, `PATCH /settings`, passkey renames) is 1–40
+  characters after trimming, with no control characters, line or paragraph separators, bidirectional overrides,
+  double quotes, backslashes or backticks: names reach the assistants' instructions and the MCP title (T2.F).
 - `passkeyName` defaults from the User-Agent ("MacBook Pro", "iPhone").
 - Setup and invite tokens are 32 random bytes, base64url; links carry them in the **fragment** (`#t=`), so neither
   Caddy's nor frps's logs nor a `Referer` ever contain them.
@@ -317,12 +337,12 @@ Register rules:
 ### 3.3 Me (any person, about themselves)
 | Method, path | Level | Request | Response |
 |---|---|---|---|
-| `PATCH /me` | session | `{"name?":"Роман","language?":"en"}` | `200 Person` |
+| `PATCH /me` | session | `{"name?":"Роман","language?":"en"}` | `200 Person`; a change is audited as `person.update` |
 | `GET /me/passkeys` | session | — | `200 {"items":[Passkey…]}` |
 | `POST /me/passkeys/begin` | self ✋ | `{}` | `200 {"ceremonyId","publicKey":{creation options, excludeCredentials = own passkeys}}` |
 | `POST /me/passkeys/finish` | self ✋ | `{"ceremonyId","credential","name":"iPhone"}` | `201 Passkey`; `409 passkey_exists` |
 | `PATCH /me/passkeys/{id}` | session | `{"name":"iPhone"}` | `200 Passkey` |
-| `DELETE /me/passkeys/{id}` | self ✋ | — | `204`; `409 last_passkey`. Sessions signed in with it are deleted too. |
+| `DELETE /me/passkeys/{id}` | self ✋ | — | `204`; `409 last_passkey` (it is the last one of the current relay domain; passkeys of an old domain can always go). Sessions signed in with it are deleted too. |
 | `GET /me/sessions` | session | — | `200 {"items":[Session…]}` |
 | `DELETE /me/sessions/{id}` | session | — | `204` (deleting `current` is a logout) |
 | `POST /me/sessions/revoke-others` | session | `{}` | `200 {"revoked":2}` |
@@ -354,9 +374,9 @@ Register rules:
 | `GET /plugins/{id}/inventory` | owner | — | `200 {"items":[InventoryItem…],"fetchedAt":"…"}`; `404 no_inventory`, `422 tool_failed`, `503 plugin_unavailable`, `504 timeout` |
 | `GET /plugins/{id}/logs` | owner | `?tail=200` (1–1000) | `200 {"lines":["…"]}`, oldest first; live lines via SSE `?logs=<id>` |
 | `GET /plugins/preview` | owner | `?repo=devXpro/gpt-tv&version=latest` | `200` below; `404 not_found` (no repo or release), `502 upstream` |
-| `POST /plugins` | owner ✋ | `{"repo":"devXpro/gpt-tv","version?":"0.2.0","id?":"tv"}` | `202 Job` (`plugin.install`); `409 conflict` (id taken) |
-| `POST /plugins/{id}/update` | owner ✋ | `{"version?":"0.3.0"}` | `202 Job` (`plugin.update`); `409 job_running` |
-| `DELETE /plugins/{id}` | owner ✋ | `?keepData=false` | `202 Job` (`plugin.remove`); data dir deleted unless `keepData=true` |
+| `POST /plugins` | owner ✋ | `{"repo":"devXpro/gpt-tv","version?":"0.2.0","id?":"tv"}` | `202 Job` (`plugin.install`); `409 conflict` (id taken); `409 job_running` |
+| `POST /plugins/{id}/update` | owner ✋ | `{"version?":"0.3.0","allowDowngrade?":true}` | `202 Job` (`plugin.update`); `409 job_running`; `409 downgrade`; `403 forbidden` (`allowDowngrade` from the web) |
+| `DELETE /plugins/{id}` | owner ✋ | `?keepData=false` | `202 Job` (`plugin.remove`); `409 job_running`; data dir deleted unless `keepData=true` |
 | `POST /plugins/check-updates` | owner | `{}` | `200 {"items":[PluginSummary…]}` with `update` refreshed (GitHub, cached 6 h otherwise) |
 | `GET /tools` | owner | `?audience=admin\|assistant&plugin=tv` | `200 {"items":[Tool…]}`; `audience=admin` (default) lists every tool |
 | `POST /tools/{name}/calls` | owner | `{"args":{…}}`, `?wait=1` optional | `202 Call` (running), or with `wait=1`: `200 Call` (finished) |
@@ -369,9 +389,19 @@ Register rules:
 `GET /plugins/preview` answer (from the release's `gpt-home-plugin.json`):
 ```json
 {"repo":"devXpro/gpt-tv","id":"tv","title":"TV","description":"LG webOS TVs: power, volume, inputs.",
- "version":"0.2.0","publishedAt":"…","homepage":"https://github.com/devXpro/gpt-tv","minHubVersion":"0.2.0",
+ "version":"0.2.0","publishedAt":"…","homepage?":"https://github.com/devXpro/gpt-tv","minHubVersion":"0.2.0",
  "compatible":true,"assetFound":true,"installed?":{"version":"0.1.0"}}
 ```
+`homepage` is the plugin author's text: it is sent only when it is an absolute `https` URL with a host and no
+credentials, and the SPA shows it as a link of its own; the source link is always `https://github.com/<repo>`.
+
+Jobs and versions:
+- One job at a time per plugin: an install, an update and a removal of the same plugin id refuse each other with
+  `409 job_running` (an install by repo learns its id from the release, so the job itself may end `job_running`).
+- Downgrades: an update to a release older than the installed one (the hub's: older than the running homed) is
+  refused. The web never downgrades: an explicit older `version` answers `409 downgrade`, `allowDowngrade` answers
+  `403 forbidden`, and a `"latest"` that resolves to an older release ends the job with `downgrade`. Only the socket
+  may send `"allowDowngrade": true` (e.g. `curl --unix-socket <data_dir>/homed.sock`, DEV.md).
 
 Tool call rules:
 - Any tool may be called (admin sees both audiences). Arguments are validated against `inputSchema` with
@@ -396,7 +426,7 @@ Tool call rules:
 
 Filters (all optional, combined with AND): `kind=tool|admin`, `person=<id>`, `plugin=<id>`, `tool=<name>`,
 `via=site,mcp` (comma list), `status=ok|failed`, `since`, `until` (RFC 3339). Newest first. Records older than 180 days
-are pruned daily.
+are pruned when homed starts and then every 24 hours.
 
 ### 3.7 People and keys
 | Method, path | Level | Request | Response |
@@ -437,10 +467,10 @@ are pruned daily.
 | `PUT /relay` | owner ✋ | `{"code":"ghr1.…"}` | `202 RelayStatus` (`connecting`); `400 invalid_args` (bad code); `409 domain_change_local_only` |
 | `GET /system` | owner | — | `200 SystemInfo` |
 | `POST /system/check-update` | owner | `{}` | `200 SystemInfo` (refreshed from GitHub) |
-| `POST /system/update` | owner ✋ | `{"version?":"0.3.0"}` | `202 Job` (`hub.update`); homed exits after `replace`, the service manager restarts it, the SPA waits for SSE `hello` with the new version |
+| `POST /system/update` | owner ✋ | `{"version?":"0.3.0","allowDowngrade?":true}` | `202 Job` (`hub.update`); `409 downgrade`; `403 forbidden` (`allowDowngrade` from the web, §3.5); homed exits after `replace`, the service manager restarts it, the SPA waits for SSE `hello` with the new version |
 
 `PUT /relay` from the web accepts only a code for the **current** domain (a token rotation). A new domain would
-change the WebAuthn RP ID and lock every passkey out, so it is done on the home box: `homed relay connect <code>`,
+change the WebAuthn RP ID and lock every passkey out, so it is done on the home box: `homed relay connect -`,
 then `homed admin reset-access`.
 
 ## 4. Server-sent events — `GET /api/admin/events`
@@ -471,20 +501,32 @@ then `homed admin reset-access`.
 | `session.revoked` | `{}` | this session was revoked or expired; the stream closes | yes |
 | `plugin.log` | `{"pluginId":"tv","lines":["…"]}` | new stderr lines (batched per 250 ms) | no |
 
-## 5. First-run LAN page (setup listener, T2.2)
-Served only on `setup_listen` (default `0.0.0.0:8090`), plain HTTP on the LAN, and only until an owner with a passkey
-exists; afterwards every path answers `410 setup_done`. Same error format and `X-GPT-Home: 1` rule; the cookie is
-`gh_firstrun` (`HttpOnly; SameSite=Strict`, not `Secure`: this is http on the LAN) and lives 30 minutes.
+## 5. First-run LAN page (setup listener, T2.2, hardened in T2.F)
+Plain HTTP, so it is short-lived and narrow (docs/SECURITY.md):
+- It listens on `setup_listen`; by default on the home network (`0.0.0.0:8090`) only while homed has no relay, and
+  on `127.0.0.1:8090` once it has one (then the page only issues the link, which the home box opens or shows as a QR
+  code).
+- It opens when homed starts while no owner has a passkey of the current relay domain, and closes 30 minutes later,
+  or for good after 20 wrong PINs from anyone; `homed admin firstrun` (socket `POST /local/firstrun`, §6) opens it
+  again with a new PIN, and `homed admin setup-link` never needs it. Once an owner has such a passkey every path
+  answers `410 setup_done`; while it is closed, `410 setup_closed`.
+- The PIN has 8 digits (shown `1234 5678`; spaces and dashes are ignored) and changes every 10 minutes and after
+  every issued link. homed prints it only to a terminal; under launchd or systemd it never reaches the log (the log
+  says to run `homed admin firstrun` or `homed admin setup-link`).
+- Same error format and `X-GPT-Home: 1` rule; the cookie is `gh_firstrun` (`HttpOnly; SameSite=Strict`, not
+  `Secure`: this is http on the LAN) and lives 30 minutes.
 
 | Method, path | Level | Request | Response |
 |---|---|---|---|
 | `GET /api/firstrun/state` | public | — | `200 {"step":"pin"}`, or with the cookie `{"step":"relay\|connecting\|link","homeName":"…","relay?":RelayStatus}` |
-| `POST /api/firstrun/pin` | public | `{"pin":"123456"}` | `204` + cookie; `401 wrong_pin`; `429 rate_limited` |
-| `POST /api/firstrun/relay` | cookie | `{"code":"ghr1.…"}` | `202 RelayStatus`; skipped (step `connecting`) when homed already has a relay |
+| `POST /api/firstrun/pin` | public | `{"pin":"12345678"}` | `204` + cookie; `401 wrong_pin`; `429 rate_limited` (this device: 5 wrong PINs per 10 minutes); `410 setup_closed` (the 20th wrong PIN closes the page) |
+| `POST /api/firstrun/relay` | cookie | `{"code":"ghr1.…"}` | `202 RelayStatus`; `409 conflict` when homed already has a relay (it is changed only on the home box or with step-up in the admin) |
 | `GET /api/firstrun/events` | cookie | — | SSE with `relay` events only |
 | `POST /api/firstrun/link` | cookie | `{}` | `200 {"url":"https://<domain>/admin/setup#t=<token>","expiresAt":"…"}`; `409 relay_not_ready` |
 
-Each `link` call revokes the older setup links. The link is valid 15 minutes and once (PLAN §5.8).
+A link from this page is valid 3 minutes and once (the CLI's links: 15 minutes, PLAN §5.8); each `link` call revokes
+the older setup links and changes the PIN. Every link and relay code from this page is logged and audited with the
+client's LAN address.
 
 ## 6. Local socket (`<data_dir>/homed.sock`)
 - HTTP/1.1 over the unix socket, mode 0600; homed also checks that the peer's uid is its own (`getpeereid` /
@@ -500,8 +542,10 @@ Each `link` call revokes the older setup links. The link is valid 15 minutes and
   |---|---|---|
   | `POST /local/setup-link` | `{}` | `200 {"url":"https://<domain>/admin/setup#t=…","expiresAt":"…"}` (`homed admin setup-link`) |
   | `POST /local/reset-access` | `{}` | `200 {"url","expiresAt","revokedPasskeys":2,"revokedSessions":3}` (`homed admin reset-access`) |
+  | `POST /local/firstrun` | `{}` | `200 {"urls":["http://192.168.68.63:8090/firstrun",…],"pin":"12345678","pinUntil":"…","closesAt":"…"}` (`homed admin firstrun`): opens the first-run page when it is closed, else shows it; `409 owner_exists`; `409 conflict` (cannot listen). Running homed only. |
   | `POST /plugins` with `{"source":"local","id":"tv","command":["/…/gpt-tv","serve"]}` | | `201 PluginSummary` (`homed plugin add`); the web can only install from GitHub |
-  | `PUT /relay` with a code for any domain | | `202 RelayStatus` (`homed relay connect`) |
+  | `PUT /relay` with a code for any domain | | `202 RelayStatus` (`homed relay connect -`) |
+  | `POST /plugins/{id}/update`, `POST /system/update` with `"allowDowngrade": true` | | `202 Job`: the only way to install an older release (§3.5) |
 
 - **Phase 1 → phase 2.** T1.3's socket served `GET /v1/tools`, `POST /v1/tools/{name}`, `GET /v1/plugins`,
   `GET /v1/relay` and `POST /v1/reload`. Since T2.6 the socket serves only `/api/admin/*` and the CLI uses
@@ -515,14 +559,15 @@ Each `link` call revokes the older setup links. The link is valid 15 minutes and
 
 | Action | When |
 |---|---|
-| `auth.setup` | the owner registered through a setup link [person] |
-| `auth.join` [P3] | a member registered through an invite [person] |
+| `auth.setup` | the owner registered through a setup link [person]; a failed finish (passkey not verified, link used or expired, passkey exists) is the same action with `ok: false` |
+| `auth.join` [P3] | a member registered through an invite [person]; failures as for `auth.setup` |
 | `auth.login` / `auth.login_failed` | sign-in; failures carry no person |
-| `auth.step_up` | a step-up assertion succeeded |
+| `auth.step_up` | a step-up assertion succeeded, or failed (`ok: false`) |
 | `auth.logout` | logout |
-| `passkey.add` / `passkey.rename` / `passkey.remove` | [passkey name] |
+| `passkey.add` / `passkey.rename` / `passkey.remove` | [passkey name]; a failed `passkey.add` has `ok: false` |
 | `session.revoke` | [session device] |
 | `key.create` / `key.revoke` | [key id] |
+| `person.update` | `PATCH /me` changed the person's name or language [person]; details = the changed keys |
 | `person.create` / `person.update` / `person.remove` [P3] | [person] |
 | `invite.create` / `invite.revoke` [P3] | [person] |
 | `connection.create` / `connection.publish` / `connection.revoke` [P3] | [person] |
@@ -533,7 +578,12 @@ Each `link` call revokes the older setup links. The link is valid 15 minutes and
 | `access.reset` | `homed admin reset-access` |
 | `setup.link` | a setup link was made (LAN page or CLI) |
 
-Arguments and details pass through `audit.Redact`; tokens, keys, codes and credentials never reach the log.
+- Details `{"client":"…"}` name where a request came from: `auth.login_failed`, registrations (`auth.setup`,
+  `auth.join`), failed `auth.step_up` and `passkey.add` (the address behind the relay, §1.7), and `setup.link` and
+  `relay.change` from the first-run page (the device's LAN address).
+- Arguments and details pass through `audit.Redact`; tokens, keys, codes and credentials never reach the log. The
+  error text of a tool call is the gateway's (`gateway.AuditError`): a validation failure that may quote a redacted
+  argument is stored as "invalid arguments", for the admin's calls as for the assistants'.
 
 ## 8. Notes for the implementers
 - **Progress from plugins (T2.3).** `hub.ToolHost.Call` has no progress channel and `hub.go` is frozen. Proposal,

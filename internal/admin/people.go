@@ -7,7 +7,6 @@ import (
 	"strings"
 	"unicode/utf8"
 
-	"github.com/devXpro/gpt-home/internal/hub"
 	"github.com/devXpro/gpt-home/internal/keys"
 	"github.com/devXpro/gpt-home/internal/store"
 )
@@ -118,30 +117,11 @@ func (s *Server) deleteKey(q *request) error {
 	return noContent(q)
 }
 
-// rebuildKeys hands the full key set, with every person's current name and scope, to the resolver.
+// rebuildKeys has the resolver re-read the full key set, with every person's current name and scope, before the
+// answer goes out.
 func (s *Server) rebuildKeys(ctx context.Context) error {
 	if s.opts.Keys == nil {
 		return nil
 	}
-	people, err := s.st.People().List(ctx)
-	if err != nil {
-		return err
-	}
-	byID := make(map[string]hub.Person, len(people))
-	for _, p := range people {
-		byID[p.ID] = hub.Person{ID: p.ID, Name: p.Name, Plugins: p.Plugins}
-	}
-	list, err := s.st.Keys().List(ctx)
-	if err != nil {
-		return err
-	}
-	entries := make([]keys.Entry, 0, len(list))
-	for _, k := range list {
-		p, ok := byID[k.PersonID]
-		if !ok {
-			continue
-		}
-		entries = append(entries, keys.Entry{Person: p, SHA256: k.SHA256})
-	}
-	return s.opts.Keys.Update(entries)
+	return s.opts.Keys.Rebuild(ctx)
 }

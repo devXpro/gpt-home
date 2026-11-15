@@ -4,7 +4,9 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"regexp"
 	"runtime"
 	"strings"
@@ -31,12 +33,16 @@ type Manifest struct {
 	Homepage      string   `json:"homepage"`
 }
 
-// ParseManifest decodes and validates a manifest. Args default to ["serve"], Title to the id.
+// ParseManifest decodes and validates a manifest: exactly one JSON object, nothing after it but white space. Args
+// default to ["serve"], Title to the id.
 func ParseManifest(data []byte) (*Manifest, error) {
 	var m Manifest
 	dec := json.NewDecoder(bytes.NewReader(data))
 	if err := dec.Decode(&m); err != nil {
 		return nil, fmt.Errorf("%w: %w", ErrBadManifest, err)
+	}
+	if _, err := dec.Token(); !errors.Is(err, io.EOF) {
+		return nil, fmt.Errorf("%w: data after the JSON object", ErrBadManifest)
 	}
 	if !pluginIDRE.MatchString(m.ID) {
 		return nil, fmt.Errorf("%w: id %q must match %s", ErrBadManifest, m.ID, pluginIDRE)

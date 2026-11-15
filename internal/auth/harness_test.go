@@ -106,7 +106,7 @@ func (e *env) endedSessions() []string {
 // link makes a setup link the way `homed admin setup-link` does and returns its token.
 func (e *env) link() string {
 	e.t.Helper()
-	l, err := NewSetupLink(context.Background(), e.st, nil, testOrigin, "cli", e.clock.Now())
+	l, err := NewSetupLink(context.Background(), e.st, nil, LinkRequest{Origin: testOrigin, Via: "cli"}, e.clock.Now())
 	if err != nil {
 		e.t.Fatal(err)
 	}

@@ -19,6 +19,7 @@ import { JobSteps } from '@/features/run/jobs'
 import { api, isApiError } from '@/lib/api'
 import { errorText, jobErrorText } from '@/lib/errors'
 import { useDelayed, useIsDesktop } from '@/lib/hooks'
+import { httpsLink } from '@/lib/links'
 import { fade } from '@/lib/motion'
 import { qk, useJob, usePlugins, usePreview } from '@/lib/queries'
 import { pluginTone } from '@/lib/status'
@@ -234,11 +235,13 @@ function Preview({ repo, onBack, onStarted }: { repo: string; onBack: () => void
     )
   }
   const title = moduleTitle(p, t)
+  const website = httpsLink(p.homepage)
   const install = async () => {
     setBusy(true)
     setError(undefined)
     try {
-      const job = await withStepUp(() => api.post<Job>('/plugins', { repo: p.repo }), t('stepup.action.install', { title }))
+      // The id from the preview lets homed refuse at once a job for a plugin that another job is changing.
+      const job = await withStepUp(() => api.post<Job>('/plugins', { repo: p.repo, id: p.id }), t('stepup.action.install', { title }))
       if (job) {
         qc.setQueryData(qk.job(job.id), job)
         onStarted(job.id, p)
@@ -259,11 +262,12 @@ function Preview({ repo, onBack, onStarted }: { repo: string; onBack: () => void
       </div>
       <Section className="mt-6">
         <Row title={t('add.version')} trailing={<span className="tabular-nums">{p.version}</span>} />
+        {/* The source is always the repo the files come from; the author's homepage is a link of its own. */}
         <Row
           title={t('add.source')}
           subtitle={
             <a
-              href={p.homepage ?? `https://github.com/${p.repo}`}
+              href={`https://github.com/${p.repo}`}
               target="_blank"
               rel="noreferrer noopener"
               className="inline-flex max-w-full items-center gap-1 text-accent-text hover:underline"
@@ -273,6 +277,22 @@ function Preview({ repo, onBack, onStarted }: { repo: string; onBack: () => void
             </a>
           }
         />
+        {website && (
+          <Row
+            title={t('add.website')}
+            subtitle={
+              <a
+                href={website.href}
+                target="_blank"
+                rel="noreferrer noopener"
+                className="inline-flex max-w-full items-center gap-1 text-accent-text hover:underline"
+              >
+                <span className="truncate">{website.host}</span>
+                <ExternalLink aria-hidden className="size-3.5 shrink-0" />
+              </a>
+            }
+          />
+        )}
         {!p.compatible && p.minHubVersion && <Row title={t('add.requires', { version: p.minHubVersion })} titleClassName="text-warning-text" />}
       </Section>
       {!p.compatible && <p className="mt-3 px-1 type-footnote text-warning-text">{t('add.incompatible')}</p>}

@@ -34,8 +34,10 @@ func (l Limits) withDefaults() Limits {
 }
 
 // Unpack extracts the tar.gz at archive into dest, which must exist and should be empty. It refuses absolute and
-// ".." paths, duplicate entries, hard links, devices and FIFOs, symlinks that are absolute or point outside dest,
-// and anything over the limits (counted on real decompressed bytes, so a gzip bomb stops at the cap). Every
+// ".." paths, duplicate entries, links of any kind (symbolic and hard), devices and FIFOs, and anything over the
+// limits (counted on real decompressed bytes, so a gzip bomb stops at the cap). Release archives hold regular files
+// and directories only; a symlink, even one that looks harmless on its own, can be chained with another
+// (a/b/up -> ../.. and then x -> a/b/up/..) so that a later write outside os.Root follows it out of dest. Every
 // filesystem call goes through os.Root, which independently refuses to leave dest. Permissions are normalized to
 // 0755 (any exec bit) or 0644; setuid and friends are dropped.
 func Unpack(archive, dest string, lim Limits) error {
@@ -95,16 +97,9 @@ func Unpack(archive, dest string, lim Limits) error {
 				return err
 			}
 			remaining -= n
-		case tar.TypeSymlink:
-			if err := checkSymlink(name, hdr.Linkname); err != nil {
-				return err
-			}
-			if err := mkParent(root, name); err != nil {
-				return err
-			}
-			if err := root.Symlink(hdr.Linkname, name); err != nil {
-				return fmt.Errorf("%w: symlink %s: %w", ErrUnsafeArchive, name, err)
-			}
+		case tar.TypeSymlink, tar.TypeLink:
+			return fmt.Errorf("%w: %s is a link (to %q); release archives may hold only files and directories",
+				ErrUnsafeArchive, name, hdr.Linkname)
 		default:
 			return fmt.Errorf("%w: %s has forbidden entry type %q", ErrUnsafeArchive, name, hdr.Typeflag)
 		}
@@ -132,18 +127,6 @@ func cleanEntryName(raw string) (string, error) {
 		return "", fmt.Errorf("%w: non-local entry name %q", ErrUnsafeArchive, raw)
 	}
 	return name, nil
-}
-
-// checkSymlink accepts only relative targets that stay inside the archive root once resolved from the link's directory.
-func checkSymlink(name, target string) error {
-	if target == "" || strings.ContainsAny(target, "\x00\\") || path.IsAbs(target) {
-		return fmt.Errorf("%w: symlink %s -> %q", ErrUnsafeArchive, name, target)
-	}
-	resolved := path.Join(path.Dir(name), target)
-	if resolved == ".." || strings.HasPrefix(resolved, "../") {
-		return fmt.Errorf("%w: symlink %s escapes the target directory", ErrUnsafeArchive, name)
-	}
-	return nil
 }
 
 func mkParent(root *os.Root, name string) error {

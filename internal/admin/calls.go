@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/devXpro/gpt-home/internal/audit"
+	"github.com/devXpro/gpt-home/internal/gateway"
 	"github.com/devXpro/gpt-home/internal/hub"
 	"github.com/devXpro/gpt-home/internal/plugins"
 )
@@ -189,13 +190,15 @@ func (s *Server) invoke(ctx context.Context, caller hub.Caller, tool hub.Tool, a
 			At: start, Caller: caller, Tool: tool.Name, Args: audit.Redact(args),
 			OK: err == nil && !res.IsError, Duration: s.now().Sub(start),
 		}
+		// The audit gets the gateway's text: a plugin's validation error quotes the rejected values, which may be
+		// the secrets Redact hid in the arguments (the caller still sees the full message in the Call).
 		switch {
 		case errors.Is(err, context.Canceled):
 			e.Error = "cancelled"
-		case err != nil:
-			e.Error = err.Error()
-		case res.IsError:
+		case err == nil && res.IsError && res.Text == "":
 			e.Error = failureText(res)
+		default:
+			e.Error = gateway.AuditError(res, err)
 		}
 		s.opts.Audit.Record(context.WithoutCancel(ctx), e)
 	}

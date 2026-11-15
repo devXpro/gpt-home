@@ -114,7 +114,7 @@ sudo bash install/server.sh --print-code --dir /opt/gpt-home-relay
 ```
 
 On the home box run `homed relay connect -` and paste the code (it is read from stdin, so it stays out of the shell
-history and the process list). `homed relay connect <code>` also works, but leaves the token in both.
+history and the process list). `homed relay connect <code>` is refused for that reason.
 
 ## Home client settings (for the relay client in `homed`)
 

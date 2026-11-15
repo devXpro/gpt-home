@@ -46,12 +46,16 @@ test('first run → passkey → home → tool with progress → key → REST fa�
     },
   })
 
-  await test.step('the LAN page: the PIN homed printed, then the server code (no relay in development)', async () => {
+  await test.step('the LAN page: the PIN from `homed admin firstrun`, then the server code (no relay in development)', async () => {
     await page.goto(`${env('E2E_SETUP')}/firstrun`)
     await expect(page.getByRole('heading', { name: 'Введите PIN' })).toBeVisible()
-    const pin = /enter the PIN (\d{6})/.exec(readFileSync(env('E2E_LOG'), 'utf8'))?.[1] ?? ''
-    expect(pin).toMatch(/^\d{6}$/)
-    await page.getByRole('textbox', { name: 'Введите PIN' }).fill(pin)
+    // homed runs without a terminal here (its stderr is a log file, as under launchd): it never prints the PIN.
+    const pin = /PIN: (\d{4} \d{4})/.exec(homed('admin', 'firstrun'))?.[1] ?? ''
+    expect(pin).toMatch(/^\d{4} \d{4}$/)
+    const log = readFileSync(env('E2E_LOG'), 'utf8')
+    expect(log).not.toContain(pin.replace(' ', ''))
+    expect(log).toContain('homed admin firstrun')
+    await page.getByRole('textbox', { name: 'Введите PIN' }).fill(pin) // pasted as printed, with the space
     await expect(page.getByRole('heading', { name: 'Код сервера' })).toBeVisible()
   })
 

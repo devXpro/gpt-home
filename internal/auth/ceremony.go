@@ -20,8 +20,12 @@ const (
 	kindAddPasskey                         // POST /me/passkeys: another passkey for the signed-in person
 )
 
-// maxCeremonies bounds the pending ceremonies; the rate limits keep the public ones far below it.
+// maxCeremonies bounds the pending ceremonies of each pool: the public ones (register, login) and the ones of a
+// session (step-up, another passkey), so an anonymous flood can never crowd out a signed-in owner's step-up.
 const maxCeremonies = 1000
+
+// public reports whether anybody may begin a ceremony of this kind (no session needed).
+func (k ceremonyKind) public() bool { return k == kindRegister || k == kindLogin }
 
 // ceremony is the server side of a begun passkey ceremony (ADMIN-API §8: in memory, 5 minutes, single use).
 type ceremony struct {
@@ -34,9 +38,10 @@ type ceremony struct {
 	newPerson bool         // kindRegister: person does not exist yet and is created at finish
 	sessionID string       // kindStepUp, kindAddPasskey: the session that began it
 
-	tokenHash  string // kindRegister: the setup or invite token, consumed at finish
-	personName string // kindRegister: a new name for the person; "" keeps it
-	homeName   string // kindRegister with a setup token: a new home name; "" keeps it
+	tokenHash  string           // kindRegister: the setup or invite token, consumed at finish
+	inviteKind store.InviteKind // kindRegister: setup or member, for the audit of a failed finish
+	personName string           // kindRegister: a new name for the person; "" keeps it
+	homeName   string           // kindRegister with a setup token: a new home name; "" keeps it
 }
 
 // ceremonies holds the pending ceremonies by id.
@@ -47,17 +52,33 @@ type ceremonies struct {
 
 func newCeremonies() *ceremonies { return &ceremonies{m: map[string]*ceremony{}} }
 
-// add stores c and returns its random id. ok is false when too many ceremonies are pending.
+// add stores c and returns its random id. When c's pool is full, a public ceremony takes the place of the oldest
+// public one (a flood of begins cannot keep a real sign-in from starting), and a session's ceremony is refused (ok
+// false; the per-session limits keep that pool far from full).
 func (cs *ceremonies) add(c *ceremony, now time.Time) (id string, ok bool) {
 	cs.mu.Lock()
 	defer cs.mu.Unlock()
+	var (
+		pool      int
+		oldest    string
+		oldestExp time.Time
+	)
 	for k, v := range cs.m {
-		if !now.Before(v.expires) {
+		switch {
+		case !now.Before(v.expires):
 			delete(cs.m, k)
+		case v.kind.public() == c.kind.public():
+			pool++
+			if oldest == "" || v.expires.Before(oldestExp) {
+				oldest, oldestExp = k, v.expires
+			}
 		}
 	}
-	if len(cs.m) >= maxCeremonies {
-		return "", false
+	if pool >= maxCeremonies {
+		if !c.kind.public() {
+			return "", false
+		}
+		delete(cs.m, oldest)
 	}
 	id = wire.Random(18)
 	cs.m[id] = c

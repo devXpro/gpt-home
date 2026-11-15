@@ -4,10 +4,10 @@ import (
 	"context"
 	"errors"
 	"net/http"
-	"strings"
+	"slices"
 	"time"
-	"unicode/utf8"
 
+	"github.com/devXpro/gpt-home/internal/auth/wire"
 	"github.com/devXpro/gpt-home/internal/store"
 )
 
@@ -32,7 +32,7 @@ func (s *Server) getBootstrap(q *request) error {
 	return s.writeJSON(q, http.StatusOK, body)
 }
 
-// ownerReady reports whether an owner with at least one passkey exists.
+// ownerReady reports whether an owner with at least one usable passkey exists.
 func (s *Server) ownerReady(ctx context.Context) (bool, error) {
 	people, err := s.st.People().List(ctx)
 	if err != nil {
@@ -46,11 +46,16 @@ func (s *Server) ownerReady(ctx context.Context) (bool, error) {
 		if err != nil {
 			return false, err
 		}
-		if len(pks) > 0 {
+		if slices.ContainsFunc(pks, s.usable) {
 			return true, nil
 		}
 	}
 	return false, nil
+}
+
+// usable reports whether a passkey can sign in now (Options.UsablePasskey: it belongs to the current relying party).
+func (s *Server) usable(pk store.Passkey) bool {
+	return s.opts.UsablePasskey == nil || s.opts.UsablePasskey(pk)
 }
 
 func (s *Server) getSession(q *request) error {
@@ -112,13 +117,15 @@ func (s *Server) localPrincipal(ctx context.Context) (Principal, error) {
 	return Principal{Person: store.Person{ID: "local", Name: s.opts.LocalName, Role: roleOwner, Plugins: []string{"*"}}}, nil
 }
 
-// checkName trims a display name and checks its length (1–40 characters).
+// checkName trims a display name and checks it with the rule internal/auth applies at registration (wire.CheckName:
+// 1–40 characters, no control characters, line breaks, quotes, backslashes or backticks), answering in the admin's
+// error format.
 func checkName(path, v string) (string, error) {
-	v = strings.TrimSpace(v)
-	if n := utf8.RuneCountInString(v); n < 1 || n > 40 {
-		return "", invalidField(path, "length", "must be 1 to 40 characters")
+	name, err := wire.CheckName(path, v)
+	if we, ok := errors.AsType[*wire.Error](err); ok && len(we.Fields) > 0 {
+		return "", invalidField(we.Fields[0].Path, we.Fields[0].Code, we.Fields[0].Message)
 	}
-	return v, nil
+	return name, err
 }
 
 func checkLanguage(path, v string) error {
@@ -141,22 +148,34 @@ func (s *Server) patchMe(q *request) error {
 	if err != nil {
 		return err
 	}
+	var changed []string
 	if body.Name != nil {
-		if p.Name, err = checkName("/name", *body.Name); err != nil {
+		name, err := checkName("/name", *body.Name)
+		if err != nil {
 			return err
+		}
+		if name != p.Name {
+			p.Name = name
+			changed = append(changed, "name")
 		}
 	}
 	if body.Language != nil {
 		if err := checkLanguage("/language", *body.Language); err != nil {
 			return err
 		}
-		p.Language = *body.Language
+		if *body.Language != p.Language {
+			p.Language = *body.Language
+			changed = append(changed, "language")
+		}
 	}
-	if err := s.st.People().Update(ctx, p); err != nil {
-		return err
-	}
-	if err := s.rebuildKeys(ctx); err != nil { // a new name reaches the audit names of key callers
-		return err
+	if len(changed) > 0 {
+		if err := s.st.People().Update(ctx, p); err != nil {
+			return err
+		}
+		if err := s.rebuildKeys(ctx); err != nil { // a new name reaches the audit names of key callers
+			return err
+		}
+		s.recordAdmin(q, "person.update", p.ID, "", map[string]any{"changed": changed}, nil)
 	}
 	out, err := s.personJSON(ctx, p)
 	if err != nil {
@@ -215,7 +234,20 @@ func (s *Server) deleteMyPasskey(q *request) error {
 		return err
 	}
 	ctx := q.r.Context()
-	err = s.st.Passkeys().Delete(ctx, pk.ID)
+	// The last passkey that can still sign in stays, even next to passkeys of an old relay domain (which the store's
+	// own count would accept); the check and the delete share one transaction.
+	err = s.st.InTx(ctx, func(tx store.Store) error {
+		if s.usable(pk) {
+			pks, err := tx.Passkeys().ListByPerson(ctx, pk.PersonID)
+			if err != nil {
+				return err
+			}
+			if !slices.ContainsFunc(pks, func(o store.Passkey) bool { return o.ID != pk.ID && s.usable(o) }) {
+				return store.ErrLastPasskey
+			}
+		}
+		return tx.Passkeys().Delete(ctx, pk.ID)
+	})
 	if errors.Is(err, store.ErrLastPasskey) {
 		return errorf(http.StatusConflict, "last_passkey", "the last passkey cannot be removed")
 	}

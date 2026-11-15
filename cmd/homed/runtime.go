@@ -73,12 +73,16 @@ func (r *pluginRuntime) Restart(ctx context.Context, id string) error {
 }
 
 // keyResolver is the gateway's hub.KeyResolver over the store's person keys: keys.Resolver does the constant-time
-// match, and a used key's LastUsedAt is stored at most once a minute. It is also the admin's KeyUpdater, which hands
-// it the full set after every key change.
+// match, and a used key's LastUsedAt is stored at most once a minute. It is also the admin's KeyUpdater: every
+// rebuild (the admin after a key or person change, SIGHUP, a registration) goes through Rebuild.
 type keyResolver struct {
 	st  store.Store
 	res *keys.Resolver
 	log *slog.Logger
+
+	// rebuild is held from the store read to the swap, so rebuilds land in the order they read the store: a slow one
+	// that read before a revoke cannot swap after the revoke's own rebuild and bring the key back.
+	rebuild sync.Mutex
 
 	mu      sync.Mutex
 	ids     map[string]string    // sha256 → key id
@@ -98,11 +102,14 @@ func newKeyResolver(ctx context.Context, st store.Store, log *slog.Logger) (*key
 		return nil, err
 	}
 	k := &keyResolver{st: st, res: res, log: log, ids: map[string]string{}, touched: map[string]time.Time{}}
-	return k, k.reload(ctx)
+	return k, k.Rebuild(ctx)
 }
 
-// reload rebuilds the key set from the store: every key with its person's current name and plugin scope.
-func (k *keyResolver) reload(ctx context.Context) error {
+// Rebuild implements admin.KeyUpdater: it reads every key with its person's current name and plugin scope from the
+// store and swaps the set (and the key ids for LastUsedAt), all under one lock that every rebuild path takes.
+func (k *keyResolver) Rebuild(ctx context.Context) error {
+	k.rebuild.Lock()
+	defer k.rebuild.Unlock()
 	people, err := k.st.People().List(ctx)
 	if err != nil {
 		return err
@@ -116,28 +123,15 @@ func (k *keyResolver) reload(ctx context.Context) error {
 		return err
 	}
 	entries := make([]keys.Entry, 0, len(list))
+	ids := make(map[string]string, len(list))
 	for _, key := range list {
 		if p, ok := byID[key.PersonID]; ok {
 			entries = append(entries, keys.Entry{Person: p, SHA256: key.SHA256})
+			ids[key.SHA256] = key.ID
 		}
 	}
-	return k.Update(entries)
-}
-
-// Update implements admin.KeyUpdater: it swaps the key set and reads the key ids for LastUsedAt.
-func (k *keyResolver) Update(entries []keys.Entry) error {
 	if err := k.res.Update(entries); err != nil {
 		return err
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	list, err := k.st.Keys().List(ctx)
-	if err != nil {
-		return err
-	}
-	ids := make(map[string]string, len(list))
-	for _, key := range list {
-		ids[key.SHA256] = key.ID
 	}
 	k.mu.Lock()
 	k.ids = ids

@@ -254,7 +254,7 @@ func TestInstallerAdapter(t *testing.T) {
 
 	// An update whose binary does not start: the old row and binary come back.
 	gh.publish(t, repo, "2.0.0", "fakeplugin", []byte("#!/bin/sh\necho broken >&2\nexit 3\n"), manifest)
-	if err := in.Update(ctx, "fake", "", rep.report); jobCode(err) != "rolled_back" {
+	if err := in.Update(ctx, "fake", "", false, rep.report); jobCode(err) != "rolled_back" {
 		t.Fatalf("broken update: %v", err)
 	}
 	if steps, _ := rep.take(); !slices.Contains(steps, "switch") || steps[len(steps)-1] != "rollback" {
@@ -269,7 +269,7 @@ func TestInstallerAdapter(t *testing.T) {
 
 	// A good update switches; the previous version stays on disk for the next rollback.
 	gh.publish(t, repo, "3.0.0", "fakeplugin", exe, manifest)
-	if err := in.Update(ctx, "fake", "3.0.0", rep.report); err != nil {
+	if err := in.Update(ctx, "fake", "3.0.0", false, rep.report); err != nil {
 		t.Fatal(err)
 	}
 	if steps, _ := rep.take(); !slices.Equal(steps, []string{"resolve", "download", "verify", "unpack", "switch", "start"}) {
@@ -281,6 +281,38 @@ func TestInstallerAdapter(t *testing.T) {
 	if latest, err := in.LatestVersion(ctx, repo); err != nil || latest != "3.0.0" {
 		t.Fatalf("latest = %q, %v", latest, err)
 	}
+
+	// An older release is a downgrade: refused unless allowed (the admin allows it only on the socket, with a flag).
+	if err := in.Update(ctx, "fake", "1.0.0", false, rep.report); jobCode(err) != "downgrade" {
+		t.Fatalf("downgrade: %v", err)
+	}
+	if p := row(); p.Version != "3.0.0" || !up() {
+		t.Fatalf("row after the refused downgrade = %+v", p)
+	}
+	rep.take()
+
+	// One job per plugin: while another job holds it, an install, an update and a removal answer job_running.
+	unlock, err := in.locks.lock("fake")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := in.locks.lock("fake"); jobCode(err) != "job_running" {
+		t.Fatalf("second lock: %v", err)
+	}
+	if err := in.Update(ctx, "fake", "", false, rep.report); jobCode(err) != "job_running" {
+		t.Fatalf("update while locked: %v", err)
+	}
+	if err := in.Remove(ctx, "fake", false, rep.report); jobCode(err) != "job_running" {
+		t.Fatalf("remove while locked: %v", err)
+	}
+	if _, err := in.Install(ctx, repo, "", "", rep.report); jobCode(err) != "job_running" {
+		t.Fatalf("install while locked: %v", err)
+	}
+	unlock()
+	if p := row(); p.Version != "3.0.0" || !up() {
+		t.Fatalf("row after the refused jobs = %+v", p)
+	}
+	rep.take()
 
 	if err := in.Remove(ctx, "fake", false, rep.report); err != nil {
 		t.Fatal(err)
@@ -305,7 +337,7 @@ func TestInstallerAdapter(t *testing.T) {
 	if rel, err := in.LatestHub(ctx); err != nil || rel.Version != "0.2.0" || !strings.HasSuffix(rel.NotesURL, "/v0.2.0") {
 		t.Fatalf("latest hub = %+v, %v", rel, err)
 	}
-	if err := in.UpdateHub(ctx, "", rep.report); err != nil {
+	if err := in.UpdateHub(ctx, "", false, rep.report); err != nil {
 		t.Fatal(err)
 	}
 	if steps, messages := rep.take(); steps[len(steps)-1] != "restart" || !slices.Contains(messages, "0.2.0") {

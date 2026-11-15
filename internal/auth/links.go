@@ -2,6 +2,7 @@ package auth
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -19,27 +20,43 @@ type SetupLink struct {
 	ExpiresAt time.Time
 }
 
-// NewSetupLink makes a setup link, valid for 15 minutes and once, and revokes every older one. The link names the
-// owner when one exists, so the passkey is added to them; otherwise the registration creates the owner. origin is
-// the admin's origin ("https://<domain>"); via is the audit surface: "cli" (socket, CLI) or "admin" (LAN page). rec
-// may be nil: the "setup.link" record then goes straight to st.
+// LinkRequest says who asks for a setup link and how long it lives.
+type LinkRequest struct {
+	Origin string        // the admin's origin, "https://<domain>"
+	Via    string        // the audit surface: "cli" (socket, CLI) or "admin" (the LAN first-run page)
+	Client string        // the address that asked, for the audit record; "" on the socket
+	TTL    time.Duration // the link's life; 0 means SetupLinkTTL (the LAN page asks for less)
+}
+
+// NewSetupLink makes a setup link, valid once and for req.TTL (15 minutes by default), and revokes every older one.
+// The link names the owner when one exists, so the passkey is added to them; otherwise the registration creates the
+// owner. rec may be nil: the "setup.link" record (with the client's address, when known) then goes straight to st.
 //
 // It works on any store.Store, so homed's socket handler and a CLI that opened the database itself can both use it.
 // Showing the link is the caller's business; it is a secret until used or expired.
-func NewSetupLink(ctx context.Context, st store.Store, rec AuditRecorder, origin, via string, now time.Time) (SetupLink, error) {
-	if err := checkOrigin(origin); err != nil {
+func NewSetupLink(ctx context.Context, st store.Store, rec AuditRecorder, req LinkRequest, now time.Time) (SetupLink, error) {
+	if err := checkOrigin(req.Origin); err != nil {
 		return SetupLink{}, err
 	}
+	ttl := req.TTL
+	if ttl <= 0 {
+		ttl = SetupLinkTTL
+	}
 	token := newToken()
-	if err := st.InTx(ctx, func(tx store.Store) error { return createSetupInvite(ctx, tx, token, now) }); err != nil {
+	if err := st.InTx(ctx, func(tx store.Store) error { return createSetupInvite(ctx, tx, token, now, ttl) }); err != nil {
 		return SetupLink{}, fmt.Errorf("auth: setup link: %w", err)
 	}
-	recordAudit(context.WithoutCancel(ctx), st, rec, nil, store.AuditRecord{At: now, Via: via, Action: "setup.link", OK: true})
-	return SetupLink{URL: setupURL(origin, token), ExpiresAt: now.Add(SetupLinkTTL)}, nil
+	var details json.RawMessage
+	if req.Client != "" {
+		details, _ = wire.Marshal(map[string]string{"client": req.Client})
+	}
+	recordAudit(context.WithoutCancel(ctx), st, rec, nil,
+		store.AuditRecord{At: now, Via: req.Via, Action: "setup.link", Args: details, OK: true})
+	return SetupLink{URL: setupURL(req.Origin, token), ExpiresAt: now.Add(ttl)}, nil
 }
 
-// createSetupInvite revokes the unused setup links and stores a new one for token.
-func createSetupInvite(ctx context.Context, tx store.Store, token string, now time.Time) error {
+// createSetupInvite revokes the unused setup links and stores a new one for token, valid for ttl.
+func createSetupInvite(ctx context.Context, tx store.Store, token string, now time.Time, ttl time.Duration) error {
 	owner, _, err := findOwner(ctx, tx)
 	if err != nil {
 		return err
@@ -49,7 +66,7 @@ func createSetupInvite(ctx context.Context, tx store.Store, token string, now ti
 	}
 	return tx.Invites().Create(ctx, store.Invite{
 		ID: newID("i_"), TokenHash: hashToken(token), Kind: store.InviteSetup, PersonID: owner.ID,
-		CreatedAt: now, ExpiresAt: now.Add(SetupLinkTTL),
+		CreatedAt: now, ExpiresAt: now.Add(ttl),
 	})
 }
 
@@ -94,7 +111,7 @@ func ResetAccess(ctx context.Context, st store.Store, rec AuditRecorder, origin 
 		if _, err := tx.Invites().RevokeAll(ctx, store.InviteMember, "", now); err != nil {
 			return err
 		}
-		return createSetupInvite(ctx, tx, token, now)
+		return createSetupInvite(ctx, tx, token, now, SetupLinkTTL)
 	})
 	if err != nil {
 		return Reset{}, fmt.Errorf("auth: reset access: %w", err)
@@ -122,9 +139,14 @@ func (a *Auth) ResetAccess(ctx context.Context, origin string) (Reset, error) {
 	return res, nil
 }
 
-// OwnerReady reports whether an owner with at least one passkey exists: the home then has a way in, the login screen
-// works and the first-run page is closed.
-func OwnerReady(ctx context.Context, st store.Store) (bool, error) {
+// OwnerReady reports whether an owner has at least one passkey of the relying party rpID (the relay domain, or
+// localhost in development): the home then has a way in, the login screen works and the first-run page is closed.
+// Passkeys of another relying party (registered before a relay change) can no longer sign in and do not count; with
+// no relying party yet (rpID "") nothing does.
+func OwnerReady(ctx context.Context, st store.Store, rpID string) (bool, error) {
+	if rpID == "" {
+		return false, nil
+	}
 	people, err := st.People().List(ctx)
 	if err != nil {
 		return false, err
@@ -137,11 +159,38 @@ func OwnerReady(ctx context.Context, st store.Store) (bool, error) {
 		if err != nil {
 			return false, err
 		}
-		if len(pks) > 0 {
-			return true, nil
+		for _, pk := range pks {
+			if PasskeyRPID(pk) == rpID {
+				return true, nil
+			}
 		}
 	}
 	return false, nil
+}
+
+// OwnerReady is the package's OwnerReady for the current relying party; false while there is none.
+func (a *Auth) OwnerReady(ctx context.Context) (bool, error) {
+	rp, ok := a.rp()
+	if !ok {
+		return false, nil
+	}
+	return OwnerReady(ctx, a.st, rp.ID)
+}
+
+// PasskeyRPID returns the relying party ID a stored passkey belongs to; "" when its credential cannot be read.
+func PasskeyRPID(pk store.Passkey) string {
+	id, _, err := decodeCredential(pk.Credential)
+	if err != nil {
+		return ""
+	}
+	return id
+}
+
+// UsablePasskey reports whether a passkey can sign in to the home now: it belongs to the current relying party.
+// internal/admin counts only these for ownerReady and the last-passkey rule.
+func (a *Auth) UsablePasskey(pk store.Passkey) bool {
+	rp, ok := a.rp()
+	return ok && PasskeyRPID(pk) == rp.ID
 }
 
 // findOwner returns the first owner; found is false when the home has none yet.
@@ -213,7 +262,7 @@ func (a *Auth) localSetupLink(w http.ResponseWriter, r *http.Request) error {
 	if !ok {
 		return errNoOrigin
 	}
-	link, err := NewSetupLink(r.Context(), a.st, a.audit, rp.Origin, "cli", a.now())
+	link, err := NewSetupLink(r.Context(), a.st, a.audit, LinkRequest{Origin: rp.Origin, Via: "cli"}, a.now())
 	if err != nil {
 		return err
 	}

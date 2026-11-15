@@ -6,8 +6,8 @@
 //   - the LAN first-run listener at /firstrun and /admin/ (the page loads its assets from /admin/assets/).
 //
 // Every path that is not a file gets index.html, so client routes (/admin/devices/tv, /firstrun) survive a reload.
-// Hashed assets are cached for a year; everything else revalidates by ETag. Every response carries a strict CSP:
-// no inline scripts or styles and no eval (DESIGN.md §12).
+// Hashed assets are cached for a year; everything else revalidates by ETag. Every response carries a strict CSP (no
+// inline scripts or styles and no eval, DESIGN.md §12) and Strict-Transport-Security.
 package web
 
 import (
@@ -40,6 +40,7 @@ const (
 	publicPrefix = "/admin/"
 	immutable    = "public, max-age=31536000, immutable"
 	revalidate   = "no-cache"
+	hsts         = "max-age=31536000" // a year; not includeSubDomains or preload: the domain is the owner's
 )
 
 type file struct {
@@ -126,6 +127,9 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	hdr.Set("Referrer-Policy", "no-referrer")
 	hdr.Set("X-Frame-Options", "DENY")
 	hdr.Set("Cross-Origin-Opener-Policy", "same-origin")
+	// The admin is only ever https://<domain> (the relay's Caddy may send its own; browsers ignore the header over the
+	// first-run page's plain http, as RFC 6797 says).
+	hdr.Set("Strict-Transport-Security", hsts)
 	if r.Method != http.MethodGet && r.Method != http.MethodHead {
 		hdr.Set("Allow", "GET, HEAD")
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"net/url"
 	"regexp"
 	"slices"
 	"strconv"
@@ -393,7 +394,18 @@ func (s *Server) previewPlugin(q *request) error {
 			Version string `json:"version"`
 		}{Version: row.Version}
 	}
+	pv.Homepage = safeHomepage(pv.Homepage)
 	return s.writeJSON(q, http.StatusOK, pv)
+}
+
+// safeHomepage keeps a release's homepage only when it is an absolute https URL with a host and no credentials. The
+// manifest is the plugin author's text: the admin shows it as a link of its own, never as the repo's.
+func safeHomepage(raw string) string {
+	u, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil || u.Scheme != "https" || u.Host == "" || u.User != nil || u.Opaque != "" {
+		return ""
+	}
+	return u.String()
 }
 
 func upstream(err error) error {
@@ -528,9 +540,27 @@ func (s *Server) addLocalPlugin(q *request, id string, command []string) error {
 	return s.writeJSON(q, http.StatusCreated, s.summary(v, s.host.Tools(hub.AudienceAdmin)))
 }
 
+// releaseRe matches a release version (as opposed to a development build such as "dev").
+var releaseRe = regexp.MustCompile(`^v?[0-9]+\.[0-9]+\.[0-9]+([-+].*)?$`)
+
+// checkDowngrade applies the downgrade rule to an update request: allowDowngrade is honoured only on the socket, and
+// without it an explicit version older than the installed one is refused at once (the installer refuses an older
+// "latest" in the job too).
+func checkDowngrade(q *request, allow bool, version, installed string) error {
+	if allow && !q.local {
+		return errorf(http.StatusForbidden, "forbidden", "a downgrade is allowed only on the home box (the local socket)")
+	}
+	if !allow && version != "" && version != "latest" && releaseRe.MatchString(installed) && versionLess(version, installed) {
+		return errorf(http.StatusConflict, "downgrade",
+			"the version is older than the installed one; downgrades are done on the home box")
+	}
+	return nil
+}
+
 func (s *Server) updatePlugin(q *request) error {
 	var body struct {
-		Version string `json:"version"`
+		Version        string `json:"version"`
+		AllowDowngrade bool   `json:"allowDowngrade"`
 	}
 	if err := decode(q, &body); err != nil {
 		return err
@@ -547,12 +577,15 @@ func (s *Server) updatePlugin(q *request) error {
 	if row.Source != store.PluginGitHub {
 		return errorf(http.StatusConflict, "conflict", "a local plugin is updated on the home box")
 	}
+	if err := checkDowngrade(q, body.AllowDowngrade, body.Version, row.Version); err != nil {
+		return err
+	}
 	if s.opts.Installer == nil {
 		return notReady("the plugin installer")
 	}
 	inst := s.opts.Installer
 	job, err := s.startJob(q, "plugin.update", id, func(ctx context.Context, report Reporter) (string, error) {
-		return id, inst.Update(ctx, id, body.Version, report)
+		return id, inst.Update(ctx, id, body.Version, body.AllowDowngrade, report)
 	})
 	if err != nil {
 		return err

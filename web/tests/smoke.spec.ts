@@ -119,9 +119,9 @@ test('LAN first run: PIN, connecting, one-time link', async ({ page }) => {
   const csp = await guardCSP(page)
   await open(page, '/firstrun', 'firstrun')
   await expect(page.getByRole('heading', { name: 'Введите PIN' })).toBeVisible()
-  await page.getByRole('textbox', { name: 'Введите PIN' }).fill('111111')
+  await page.getByRole('textbox', { name: 'Введите PIN' }).fill('11111111')
   await expect(page.getByText('PIN не тот. Проверьте ещё раз.')).toBeVisible()
-  await page.getByRole('textbox', { name: 'Введите PIN' }).fill('123456')
+  await page.getByRole('textbox', { name: 'Введите PIN' }).fill('12345678')
   await expect(page.getByRole('heading', { name: /Подключаемся к homie\.jobbyjobs\.work/ })).toBeVisible()
   await expect(page.getByRole('heading', { name: 'Откройте дом на телефоне или здесь' })).toBeVisible({ timeout: 15_000 })
   await expect(page.getByRole('img', { name: 'QR-код ссылки для телефона' })).toBeVisible()
@@ -129,16 +129,25 @@ test('LAN first run: PIN, connecting, one-time link', async ({ page }) => {
   await csp.expectClean()
 })
 
-test('LAN first run: five wrong PINs lock the page with a countdown', async ({ page }) => {
+test('LAN first run: five wrong PINs make this device wait, with a countdown', async ({ page }) => {
   await open(page, '/firstrun', 'firstrun')
   const pin = page.getByRole('textbox', { name: 'Введите PIN' })
   for (let i = 0; i < 5; i++) {
     await expect(pin).toBeEnabled()
-    await pin.fill(`00000${i}`)
-    await expect(page.getByRole('status').filter({ hasText: /PIN/ })).toBeVisible()
+    await pin.fill(`0000000${i}`)
+    await expect(page.getByRole('status').filter({ hasText: /PIN|попыток/ })).toBeVisible()
   }
-  await expect(page.getByText(/напечатан новый PIN — введите его через \d+:\d\d/)).toBeVisible()
+  await expect(page.getByText(/с этого устройства\. Попробуйте снова через \d+:\d\d/)).toBeVisible()
   await expect(pin).toBeDisabled()
+})
+
+test('LAN first run: a closed page says how to open it again', async ({ page }) => {
+  const csp = await guardCSP(page)
+  await open(page, '/firstrun', 'firstrun-closed')
+  await expect(page.getByText('Страница настройки закрыта')).toBeVisible()
+  await expect(page.getByText(/homed admin firstrun/)).toBeVisible()
+  await expect(page.getByRole('textbox', { name: 'Введите PIN' })).toHaveCount(0)
+  await csp.expectClean()
 })
 
 test('offline home: the banner, cached content, retry', async ({ page }) => {

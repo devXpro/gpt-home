@@ -24,16 +24,19 @@
 //	                   // admin.Auth adapter: p, err := a.Authenticate(r); return admin.Principal(p), mapped err
 //	a.RequireSession(h), a.RequireStepUp(h), auth.PrincipalFrom(ctx)   // the same rules as middleware
 //
-//	auth.NewSetupLink(ctx, st, rec, origin, via, now)  // homed admin setup-link (also the first-run page)
+//	auth.NewSetupLink(ctx, st, rec, auth.LinkRequest{Origin, Via, Client, TTL}, now) // setup-link, first-run page
 //	auth.ResetAccess(ctx, st, rec, origin, now)        // homed admin reset-access; a.ResetAccess adds the hooks
-//	auth.OwnerReady(ctx, st)                           // an owner with a passkey exists
+//	auth.OwnerReady(ctx, st, rpID)                     // an owner with a passkey of the relying party exists
 //	auth.ClientAddr(r)                                 // the client behind the relay, for rate limits
 //
 // The handlers apply ADMIN-API §1.4 (X-GPT-Home: 1, Origin, Sec-Fetch-Site) and their own session and step-up
-// checks, so they are safe without the admin in front. The public ceremonies and auth/token are rate limited per
-// client address (20 a minute) and in total (60 a minute); the client is the X-Forwarded-For hop Caddy appended
-// (see ClientAddr). The admin audit actions auth.setup, auth.join, auth.login, auth.login_failed, auth.step_up,
-// auth.logout, passkey.add, setup.link and access.reset go to Options.Audit.
+// checks, so they are safe without the admin in front. Rate limits (ADMIN-API §1.7, ratelimit.go) have separate
+// buckets per class: auth/token and registration per client address (20 a minute) and in total (60 a minute); sign-in
+// per client address, counting begins and failed finishes, with no shared bucket; step-up and another passkey per
+// session. The client is the X-Forwarded-For hop Caddy appended (see ClientAddr); requests without one have a bucket
+// of their own. The admin audit actions auth.setup, auth.join, auth.login, auth.login_failed, auth.step_up,
+// auth.logout, passkey.add, setup.link and access.reset go to Options.Audit, failures included (with the client's
+// address).
 //
 // Tokens, cookies, challenges and credentials are never logged; failed ceremonies log only the name of the check
 // that failed.

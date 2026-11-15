@@ -1,18 +1,24 @@
 // Package firstrun serves the first-run page on the home network (docs/ADMIN-API.md §5, DESIGN.md §8.3): the owner
-// enters a PIN printed in homed's terminal, pastes the server's connect code if homed has no relay yet, waits for the
+// enters a PIN homed shows on the home box, pastes the server's connect code if homed has no relay yet, waits for the
 // relay, and gets the one-time setup link https://<domain>/admin/setup#t=<token> to open on the phone or the Mac.
 //
-// The listener (setup_listen, default 0.0.0.0:8090) speaks plain HTTP on the LAN, so:
-//   - the PIN gate allows 5 wrong PINs per 10 minutes; the fifth prints a new PIN, and the page stays locked until
-//     the window passes, which caps guessing at 720 tries a day against a million PINs;
+// The listener (setup_listen: 0.0.0.0:8090 while homed has no relay, 127.0.0.1:8090 once it has one) speaks plain
+// HTTP, so the page is built to be short-lived and hard to guess (docs/SECURITY.md):
+//   - it closes 30 minutes after it opened, and for good after 20 wrong PINs; `homed admin firstrun` on the home box
+//     (or a restart) opens it again with a new PIN, and `homed admin setup-link` never needs it;
+//   - the PIN has 8 digits and changes every 10 minutes and after every issued link. It is printed only to a terminal
+//     (Options.Terminal); under launchd or systemd the log says how to get it instead;
+//   - one client gets 5 wrong PINs per 10 minutes and then waits, without locking out the other devices;
 //   - the gh_firstrun cookie (HttpOnly, SameSite=Strict, 30 minutes) is random and kept only as a hash, in memory;
+//   - links issued here live 3 minutes (the CLI's live 15); every link and relay change is logged and audited with the
+//     client's address, and a relay that is already configured is never replaced from here;
 //   - only Host names a LAN can have pass (IP literals, localhost, single-label and .local-style names), which stops
 //     DNS rebinding; mutating requests need X-GPT-Home: 1 and a same-origin Origin and Sec-Fetch-Site;
-//   - once an owner with a passkey exists every path answers 410 setup_done.
+//   - once an owner has a passkey of the current relying party every path answers 410 setup_done.
 //
-// T2.6 wires it: when Needed reports true, New(Options{…}) and ListenAndServe(ctx, setupListen). Relay is homed's
-// relay client (the same adapter that serves internal/admin, plus SelfCheckResult); UI is the SPA bundle that has
-// the /firstrun route (internal/web).
+// cmd/homed wires it: while Needed reports true, New(Options{…}) and Serve(ctx, ln); for every reopening a new Server.
+// Relay is homed's relay client (the same adapter that serves internal/admin, plus SelfCheckResult); UI is the SPA
+// bundle that has the /firstrun route (internal/web).
 package firstrun
 
 import (
@@ -29,7 +35,6 @@ import (
 	"net"
 	"net/http"
 	"net/url"
-	"os"
 	"slices"
 	"strconv"
 	"strings"
@@ -42,17 +47,42 @@ import (
 	"github.com/devXpro/gpt-home/internal/store"
 )
 
-// DefaultListen is setup_listen when homed.yaml sets none.
-const DefaultListen = "0.0.0.0:8090"
+// setup_listen defaults (DefaultListen).
+const (
+	// ListenLAN is the default while homed has no relay: the page takes the connect code, perhaps from another device
+	// on the home network (a Raspberry Pi has no browser of its own).
+	ListenLAN = "0.0.0.0:8090"
+	// ListenLocal is the default once homed has a relay: the page only issues the link, which the home box itself
+	// opens or shows as a QR code.
+	ListenLocal = "127.0.0.1:8090"
+)
+
+// DefaultListen is setup_listen when neither the command line nor homed.yaml sets it.
+func DefaultListen(hasRelay bool) string {
+	if hasRelay {
+		return ListenLocal
+	}
+	return ListenLAN
+}
 
 // CookieName is the first-run cookie. It is not __Host- and not Secure: the page is plain http on the LAN.
 const CookieName = "gh_firstrun"
 
 const (
-	cookieTTL    = 30 * time.Minute
-	maxCookies   = 64
-	maxWrongPINs = 5
-	pinWindow    = 10 * time.Minute
+	// OpenFor is how long the page stays open; then it closes until `homed admin firstrun` or a restart.
+	OpenFor = 30 * time.Minute
+	// LinkTTL is the life of a setup link issued here, shorter than the CLI's (auth.SetupLinkTTL): the page and the
+	// link travel over plain http on the home network.
+	LinkTTL = 3 * time.Minute
+	// PINEvery is how often the PIN changes; it changes after every issued link too.
+	PINEvery = 10 * time.Minute
+
+	pinDigits      = 8
+	cookieTTL      = 30 * time.Minute
+	maxCookies     = 64
+	maxWrongClient = 5                // wrong PINs one client (address) may enter per clientWindow
+	clientWindow   = 10 * time.Minute // the window of maxWrongClient
+	maxWrongTotal  = 20               // wrong PINs from everybody, then the page closes for good
 )
 
 // Relay is homed's relay as the first-run page needs it. The adapter T2.6 gives internal/admin (admin.Relay) has
@@ -77,39 +107,57 @@ type Options struct {
 	Audit auth.AuditRecorder
 	// UI serves every path outside /api/: the SPA bundle with its /firstrun route and assets. Nil answers 404.
 	UI http.Handler
-	// Terminal is where the PIN is printed; nil means os.Stderr. It must be the terminal, never a log file.
+	// Terminal is where the PIN is printed: the terminal homed runs in. Nil means homed has none (launchd, systemd,
+	// a log file): the PIN is never printed, and the log says to use `homed admin firstrun` or `homed admin setup-link`.
 	Terminal io.Writer
+	// RPID returns the passkeys' relying party ID now: the relay domain, or "localhost" in development. The page closes
+	// once an owner has a passkey of it. Nil means Relay.Domain().
+	RPID func() string
+	// OpenFor is how long Serve keeps the page open; 0 means OpenFor (30 minutes).
+	OpenFor time.Duration
 	// Log receives the page's events; the PIN and tokens never reach it.
 	Log *slog.Logger
 	// Now is the clock; nil means time.Now.
 	Now func() time.Time
 }
 
-// Server is the first-run page. Create it with New.
+// Server is one opening of the first-run page. Create it with New; a reopening is a new Server.
 type Server struct {
-	st    store.Store
-	relay Relay
-	audit auth.AuditRecorder
-	ui    http.Handler
-	term  io.Writer
-	log   *slog.Logger
-	now   func() time.Time
+	st      store.Store
+	relay   Relay
+	audit   auth.AuditRecorder
+	ui      http.Handler
+	term    io.Writer
+	rpID    func() string
+	openFor time.Duration
+	log     *slog.Logger
+	now     func() time.Time
 
-	pollEvery, pingEvery time.Duration // the event stream; tests shorten them
+	pollEvery, pingEvery, pinEvery time.Duration // the event stream and the PIN; tests shorten them
 
-	mu      sync.Mutex
-	pin     string
-	wrong   []time.Time          // wrong PINs inside the window
-	cookies map[string]time.Time // sha256 of the cookie → expiry
+	closed    chan struct{} // closed when too many wrong PINs closed the page
+	closeOnce sync.Once
+	connectMu sync.Mutex // one relay code at a time, so "no relay yet" holds until the code is stored
+
+	mu         sync.Mutex
+	pin        string
+	pinUntil   time.Time              // when the PIN changes next
+	closesAt   time.Time              // when the page closes by itself
+	wrong      map[string][]time.Time // client address → its wrong PINs inside clientWindow
+	wrongTotal int
+	cookies    map[string]time.Time // sha256 of the cookie → expiry
 }
 
-// New returns the server with a fresh PIN; Serve prints it.
+// New returns the server with a fresh PIN; Serve announces it.
 func New(o Options) (*Server, error) {
 	if o.Store == nil || o.Relay == nil {
 		return nil, errors.New("firstrun: Store and Relay are required")
 	}
-	if o.Terminal == nil {
-		o.Terminal = os.Stderr
+	if o.RPID == nil {
+		o.RPID = o.Relay.Domain
+	}
+	if o.OpenFor <= 0 {
+		o.OpenFor = OpenFor
 	}
 	if o.Log == nil {
 		o.Log = slog.New(slog.DiscardHandler)
@@ -117,48 +165,69 @@ func New(o Options) (*Server, error) {
 	if o.Now == nil {
 		o.Now = time.Now
 	}
+	now := o.Now()
 	return &Server{
-		st: o.Store, relay: o.Relay, audit: o.Audit, ui: o.UI, term: o.Terminal, log: o.Log, now: o.Now,
-		pollEvery: time.Second, pingEvery: 20 * time.Second,
-		pin: newPIN(), cookies: map[string]time.Time{},
+		st: o.Store, relay: o.Relay, audit: o.Audit, ui: o.UI, term: o.Terminal, rpID: o.RPID, openFor: o.OpenFor,
+		log: o.Log, now: o.Now,
+		pollEvery: time.Second, pingEvery: 20 * time.Second, pinEvery: PINEvery,
+		closed: make(chan struct{}), pin: newPIN(), pinUntil: now.Add(PINEvery), closesAt: now.Add(o.OpenFor),
+		wrong: map[string][]time.Time{}, cookies: map[string]time.Time{},
 	}, nil
 }
 
-// Needed reports whether the first-run page is still needed: no owner has a passkey yet.
-func Needed(ctx context.Context, st store.Store) (bool, error) {
-	ready, err := auth.OwnerReady(ctx, st)
+// Needed reports whether the first-run page is still needed: no owner has a passkey of the relying party rpID (the
+// relay domain, "localhost" in development; "" while there is none).
+func Needed(ctx context.Context, st store.Store, rpID string) (bool, error) {
+	ready, err := auth.OwnerReady(ctx, st, rpID)
 	return !ready, err
 }
 
-// newPIN returns six random digits.
+// newPIN returns pinDigits random digits.
 func newPIN() string {
-	n, err := rand.Int(rand.Reader, big.NewInt(1_000_000))
+	n, err := rand.Int(rand.Reader, big.NewInt(100_000_000))
 	if err != nil {
 		panic(err) // crypto/rand does not fail since Go 1.24
 	}
-	return fmt.Sprintf("%06d", n.Int64())
+	return fmt.Sprintf("%08d", n.Int64())
 }
 
-// ListenAndServe listens on addr (DefaultListen when empty) and serves until ctx is done.
-func (s *Server) ListenAndServe(ctx context.Context, addr string) error {
-	if addr == "" {
-		addr = DefaultListen
+// FormatPIN shows a PIN in two groups of four digits ("1234 5678"); the page ignores the space.
+func FormatPIN(pin string) string {
+	if len(pin) != pinDigits {
+		return pin
 	}
-	var lc net.ListenConfig
-	ln, err := lc.Listen(ctx, "tcp", addr)
-	if err != nil {
-		return fmt.Errorf("firstrun: listen on %s: %w", addr, err)
-	}
-	return s.Serve(ctx, ln)
+	return pin[:4] + " " + pin[4:]
 }
 
-// Serve prints the page's address and the PIN to the terminal, then serves ln until ctx is done. It closes ln.
+// PIN returns the current PIN and when it changes next, for `homed admin firstrun` over the local socket.
+func (s *Server) PIN() (pin string, until time.Time) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.pin, s.pinUntil
+}
+
+// ClosesAt returns when the page closes by itself (New plus OpenFor; Serve starts right after New).
+func (s *Server) ClosesAt() time.Time {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.closesAt
+}
+
+// Serve announces the page (the PIN on the terminal, or a hint in the log) and serves ln until ctx is done, OpenFor
+// has passed or too many wrong PINs closed it. It changes the PIN every PINEvery. It closes ln.
 func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 	s.mu.Lock()
-	pin := s.pin
+	pin, closesAt := s.pin, s.closesAt
 	s.mu.Unlock()
-	_, _ = fmt.Fprintf(s.term, "\nhomed first run: open %s on your home network and enter the PIN %s\n\n",
-		strings.Join(pageURLs(ln.Addr()), " or "), pin)
+	urls := PageURLs(ln.Addr())
+	if s.term != nil {
+		_, _ = fmt.Fprintf(s.term, "\nhomed first run: open %s and enter the PIN %s (the page closes at %s)\n\n",
+			strings.Join(urls, " or "), FormatPIN(pin), closesAt.Local().Format("15:04"))
+	} else {
+		s.log.Info("the first-run page is open; there is no terminal to show its PIN: run `homed admin firstrun` in a "+
+			"terminal on the home box for the PIN, or `homed admin setup-link` for a setup link", "urls", urls,
+			"closes", closesAt)
+	}
 	srv := &http.Server{
 		Handler:           s.Handler(),
 		ReadHeaderTimeout: 10 * time.Second,
@@ -168,10 +237,27 @@ func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 	}
 	errc := make(chan error, 1)
 	go func() { errc <- srv.Serve(ln) }()
-	select {
-	case err := <-errc:
-		return fmt.Errorf("firstrun: %w", err)
-	case <-ctx.Done():
+	rotate := time.NewTicker(s.pinEvery)
+	defer rotate.Stop()
+	closeAt := time.NewTimer(s.openFor)
+	defer closeAt.Stop()
+	why := "" // why the page closed by itself; "" when homed stops
+serving:
+	for {
+		select {
+		case err := <-errc:
+			return fmt.Errorf("firstrun: %w", err)
+		case <-ctx.Done():
+			break serving
+		case <-closeAt.C:
+			why = fmt.Sprintf("it was open for %s", s.openFor)
+			break serving
+		case <-s.closed:
+			why = fmt.Sprintf("%d wrong PINs", maxWrongTotal)
+			break serving
+		case <-rotate.C:
+			s.rotatePIN("the PIN changes every " + s.pinEvery.String())
+		}
 	}
 	shutdown, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 	defer cancel()
@@ -179,12 +265,44 @@ func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 		_ = srv.Close()
 	}
 	<-errc
+	if why != "" {
+		const again = "open it again with `homed admin firstrun`, or get a setup link with `homed admin setup-link`"
+		s.log.Warn("the first-run page closed: "+why+"; "+again, "urls", urls)
+		if s.term != nil {
+			_, _ = fmt.Fprintf(s.term, "\nhomed first run: the page closed (%s); %s\n\n", why, again)
+		}
+	}
 	return nil
 }
 
-// pageURLs lists the page's addresses for the terminal: every LAN IPv4 address and localhost when the listener is
-// on all interfaces.
-func pageURLs(addr net.Addr) []string {
+// rotatePIN makes a new PIN and shows it on the terminal, if there is one.
+func (s *Server) rotatePIN(why string) {
+	s.mu.Lock()
+	s.pin = newPIN()
+	s.pinUntil = s.now().Add(s.pinEvery)
+	pin := s.pin
+	s.mu.Unlock()
+	if s.term != nil {
+		_, _ = fmt.Fprintf(s.term, "\nhomed first run: %s; the PIN is now %s\n\n", why, FormatPIN(pin))
+	}
+	s.log.Info("first-run PIN changed", "why", why)
+}
+
+// closeForGood closes the page after too many wrong PINs; Serve shuts the listener.
+func (s *Server) closeForGood() { s.closeOnce.Do(func() { close(s.closed) }) }
+
+func (s *Server) isClosed() bool {
+	select {
+	case <-s.closed:
+		return true
+	default:
+		return false
+	}
+}
+
+// PageURLs lists the page's addresses for the terminal and `homed admin firstrun`: every LAN IPv4 address and
+// localhost when the listener is on all interfaces.
+func PageURLs(addr net.Addr) []string {
 	tcp, ok := addr.(*net.TCPAddr)
 	if !ok {
 		return []string{"http://" + addr.String() + "/firstrun"}
@@ -234,7 +352,13 @@ func (s *Server) Handler() http.Handler {
 	return s.guard(mux)
 }
 
-// guard refuses foreign Host names and closes everything once the home has an owner with a passkey.
+// errClosed answers every request once too many wrong PINs closed the page.
+var errClosed = wire.Errorf(http.StatusGone, "setup_closed",
+	"the setup page is closed; open it again with `homed admin firstrun` on the home box, or get a setup link with "+
+		"`homed admin setup-link`")
+
+// guard refuses foreign Host names and closes everything once the page closed or the home has an owner with a
+// passkey.
 func (s *Server) guard(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if !lanHost(r.Host) {
@@ -243,7 +367,12 @@ func (s *Server) guard(next http.Handler) http.Handler {
 				"open the setup page by the address homed printed"))
 			return
 		}
-		ready, err := auth.OwnerReady(r.Context(), s.st)
+		if s.isClosed() {
+			gone(w, r, errClosed, `<p>Страница настройки закрыта. Откройте её снова командой <code>homed admin firstrun</code> на домашнем компьютере.</p>`+
+				`<p lang="en">The setup page is closed. Open it again with <code>homed admin firstrun</code> on the home box.</p>`)
+			return
+		}
+		ready, err := auth.OwnerReady(r.Context(), s.st, s.rpID())
 		if err != nil {
 			s.log.Error("firstrun: cannot read the owner", "err", err)
 			wire.Headers(w)
@@ -251,26 +380,26 @@ func (s *Server) guard(next http.Handler) http.Handler {
 			return
 		}
 		if ready {
-			done(w, r)
+			gone(w, r, wire.Errorf(http.StatusGone, "setup_done", "the home is set up; this page is closed"),
+				`<p>Дом уже настроен. Эта страница больше не нужна.</p>`+
+					`<p lang="en">Your home is set up. You don't need this page anymore.</p>`)
 			return
 		}
 		next.ServeHTTP(w, r)
 	})
 }
 
-// done answers 410 setup_done: JSON for the API, a short bilingual page for a browser.
-func done(w http.ResponseWriter, r *http.Request) {
+// gone answers 410: the JSON error for the API, a short bilingual page for a browser.
+func gone(w http.ResponseWriter, r *http.Request, apiErr *wire.Error, page string) {
 	wire.Headers(w)
 	if strings.HasPrefix(r.URL.Path, "/api/") {
-		wire.WriteError(w, wire.Errorf(http.StatusGone, "setup_done", "the home is set up; this page is closed"))
+		wire.WriteError(w, apiErr)
 		return
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("Content-Security-Policy", "default-src 'none'")
 	w.WriteHeader(http.StatusGone)
-	_, _ = io.WriteString(w, `<!doctype html><html lang="ru"><meta charset="utf-8"><title>GPT-Home</title>`+
-		`<p>Дом уже настроен. Эта страница больше не нужна.</p>`+
-		`<p lang="en">Your home is set up. You don't need this page anymore.</p></html>`)
+	_, _ = io.WriteString(w, `<!doctype html><html lang="ru"><meta charset="utf-8"><title>GPT-Home</title>`+page+`</html>`)
 }
 
 // lanHost accepts the Host names a browser on the home network uses: IP literals, localhost, single-label names
@@ -340,6 +469,16 @@ func sameOrigin(r *http.Request) bool {
 	return true
 }
 
+// clientOf is the address a request came from: the page is reached directly on the LAN, with no proxy in between,
+// so the peer is the client (one address, not a /64: a home network is a single /64).
+func clientOf(r *http.Request) string {
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		return r.RemoteAddr
+	}
+	return host
+}
+
 func hashCookie(v string) string {
 	sum := sha256.Sum256([]byte(v))
 	return hex.EncodeToString(sum[:])
@@ -362,6 +501,8 @@ func (s *Server) signedIn(r *http.Request) bool {
 	return ok
 }
 
+// enterPIN checks the PIN. A client gets maxWrongClient wrong PINs per clientWindow; maxWrongTotal wrong PINs from
+// everybody close the page.
 func (s *Server) enterPIN(w http.ResponseWriter, r *http.Request) error {
 	var body struct {
 		PIN string `json:"pin"`
@@ -369,24 +510,33 @@ func (s *Server) enterPIN(w http.ResponseWriter, r *http.Request) error {
 	if err := wire.Decode(w, r, &body); err != nil {
 		return err
 	}
+	pin := strings.NewReplacer(" ", "", "-", "").Replace(strings.TrimSpace(body.PIN))
+	client := clientOf(r)
 	now := s.now()
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.wrong = slices.DeleteFunc(s.wrong, func(t time.Time) bool { return !now.Before(t.Add(pinWindow)) })
-	if len(s.wrong) >= maxWrongPINs {
-		return s.locked(now)
+	if s.isClosed() {
+		return errClosed
 	}
-	if subtle.ConstantTimeCompare([]byte(strings.TrimSpace(body.PIN)), []byte(s.pin)) != 1 {
-		s.wrong = append(s.wrong, now)
-		s.log.Warn("firstrun: wrong PIN", "client", r.RemoteAddr, "tries", len(s.wrong))
-		if len(s.wrong) < maxWrongPINs {
-			return wire.Errorf(http.StatusUnauthorized, "wrong_pin", "wrong PIN")
+	tries := slices.DeleteFunc(s.wrong[client], func(t time.Time) bool { return !now.Before(t.Add(clientWindow)) })
+	s.wrong[client] = tries
+	if len(tries) >= maxWrongClient {
+		return locked(tries, now)
+	}
+	if subtle.ConstantTimeCompare([]byte(pin), []byte(s.pin)) != 1 {
+		tries = append(tries, now)
+		s.wrong[client] = tries
+		s.wrongTotal++
+		s.log.Warn("firstrun: wrong PIN", "client", client, "tries", len(tries), "total", s.wrongTotal)
+		switch {
+		case s.wrongTotal >= maxWrongTotal:
+			s.log.Warn("firstrun: too many wrong PINs; the page closes")
+			s.closeForGood()
+			return errClosed
+		case len(tries) >= maxWrongClient:
+			return locked(tries, now)
 		}
-		s.pin = newPIN()
-		s.log.Warn("firstrun: too many wrong PINs; a new PIN was printed")
-		_, _ = fmt.Fprintf(s.term, "\nhomed first run: too many wrong PINs. The new PIN is %s (it works in %s).\n\n",
-			s.pin, s.wrong[0].Add(pinWindow).Sub(now).Round(time.Second))
-		return s.locked(now)
+		return wire.Errorf(http.StatusUnauthorized, "wrong_pin", "wrong PIN")
 	}
 	for k, exp := range s.cookies {
 		if !now.Before(exp) {
@@ -398,6 +548,7 @@ func (s *Server) enterPIN(w http.ResponseWriter, r *http.Request) error {
 	}
 	token := wire.Random(32)
 	s.cookies[hashCookie(token)] = now.Add(cookieTTL)
+	s.log.Info("firstrun: PIN accepted", "client", client)
 	//nolint:gosec // G124: plain http on the LAN by design (ADMIN-API §5); a Secure cookie would never come back.
 	http.SetCookie(w, &http.Cookie{
 		Name: CookieName, Value: token, Path: "/", MaxAge: int(cookieTTL / time.Second),
@@ -407,8 +558,8 @@ func (s *Server) enterPIN(w http.ResponseWriter, r *http.Request) error {
 	return nil
 }
 
-// locked answers while the wrong PINs fill the window; it ends when the oldest one leaves it.
-func (s *Server) locked(now time.Time) error {
+// locked answers a client whose wrong PINs fill its window; it ends when the oldest one leaves the window.
+func locked(tries []time.Time, now time.Time) error {
 	return &wire.Error{Status: http.StatusTooManyRequests, Code: "rate_limited",
-		Message: "too many wrong PINs; homed printed a new one", RetryAfter: s.wrong[0].Add(pinWindow).Sub(now)}
+		Message: "too many wrong PINs from this device; wait, then try again", RetryAfter: tries[0].Add(clientWindow).Sub(now)}
 }

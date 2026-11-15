@@ -583,17 +583,30 @@ func (r *fakeRelay) Connect(_ context.Context, c relay.Code) error {
 	return nil
 }
 
-// fakeInstaller is an Installer; Install blocks until release is closed.
+// fakeInstaller is an Installer; Install, and Update with blockUpdates set, block until release is closed.
 type fakeInstaller struct {
 	release chan struct{}
 	st      *memStore
+
+	mu           sync.Mutex
+	blockUpdates bool
+	downgrades   []bool // allowDowngrade of every Update and UpdateHub, in order
+	homepage     string // the manifest homepage Preview reports
+}
+
+func (i *fakeInstaller) allowed() []bool {
+	i.mu.Lock()
+	defer i.mu.Unlock()
+	return slices.Clone(i.downgrades)
 }
 
 func (i *fakeInstaller) Preview(_ context.Context, repo, _ string) (PluginPreview, error) {
 	if repo != "devXpro/gpt-tv" {
 		return PluginPreview{}, ErrNotFound
 	}
-	return PluginPreview{Repo: repo, ID: "tv", Title: "TV", Version: "0.3.0", Compatible: true, AssetFound: true}, nil
+	i.mu.Lock()
+	defer i.mu.Unlock()
+	return PluginPreview{Repo: repo, ID: "tv", Title: "TV", Version: "0.3.0", Homepage: i.homepage, Compatible: true, AssetFound: true}, nil
 }
 
 func (i *fakeInstaller) Install(ctx context.Context, repo, version, id string, report Reporter) (string, error) {
@@ -612,27 +625,65 @@ func (i *fakeInstaller) Install(ctx context.Context, repo, version, id string, r
 	return id, i.st.Plugins().Create(ctx, store.Plugin{ID: id, Source: store.PluginGitHub, Repo: repo, Version: version, Enabled: true})
 }
 
-func (i *fakeInstaller) Update(context.Context, string, string, Reporter) error { return nil }
-func (i *fakeInstaller) Remove(context.Context, string, bool, Reporter) error   { return nil }
+func (i *fakeInstaller) Update(ctx context.Context, _, _ string, allowDowngrade bool, _ Reporter) error {
+	i.mu.Lock()
+	i.downgrades = append(i.downgrades, allowDowngrade)
+	block := i.blockUpdates
+	i.mu.Unlock()
+	if block {
+		select {
+		case <-i.release:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	return nil
+}
+
+func (i *fakeInstaller) Remove(context.Context, string, bool, Reporter) error { return nil }
 func (i *fakeInstaller) LatestVersion(context.Context, string) (string, error) {
 	return "0.3.0", nil
 }
 func (i *fakeInstaller) LatestHub(context.Context) (HubRelease, error) {
 	return HubRelease{Version: "0.3.0", NotesURL: "https://example.invalid/notes"}, nil
 }
-func (i *fakeInstaller) UpdateHub(context.Context, string, Reporter) error { return nil }
 
-// fakeKeys records resolver updates.
+func (i *fakeInstaller) UpdateHub(_ context.Context, _ string, allowDowngrade bool, _ Reporter) error {
+	i.mu.Lock()
+	defer i.mu.Unlock()
+	i.downgrades = append(i.downgrades, allowDowngrade)
+	return nil
+}
+
+// fakeKeys records resolver rebuilds: like cmd/homed's resolver, it reads every key with its person from the store.
 type fakeKeys struct {
+	st      store.Store
 	mu      sync.Mutex
 	entries []keys.Entry
 	updates int
 }
 
-func (k *fakeKeys) Update(entries []keys.Entry) error {
+func (k *fakeKeys) Rebuild(ctx context.Context) error {
 	k.mu.Lock()
 	defer k.mu.Unlock()
-	k.entries = slices.Clone(entries)
+	people, err := k.st.People().List(ctx)
+	if err != nil {
+		return err
+	}
+	byID := map[string]hub.Person{}
+	for _, p := range people {
+		byID[p.ID] = hub.Person{ID: p.ID, Name: p.Name, Plugins: p.Plugins}
+	}
+	list, err := k.st.Keys().List(ctx)
+	if err != nil {
+		return err
+	}
+	k.entries = nil
+	for _, key := range list {
+		if p, ok := byID[key.PersonID]; ok {
+			k.entries = append(k.entries, keys.Entry{Person: p, SHA256: key.SHA256})
+		}
+	}
 	k.updates++
 	return nil
 }

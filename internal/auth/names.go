@@ -43,20 +43,8 @@ func wellFormedToken(s string) bool {
 // newID returns a public random id with a prefix, e.g. "s_…" for sessions.
 func newID(prefix string) string { return prefix + wire.Random(16) }
 
-// maxNameLen is the limit of person, home and passkey names (ADMIN-API §3.2).
-const maxNameLen = 40
-
-// checkName trims a display name and requires 1–40 characters and no control characters.
-func checkName(path, v string) (string, error) {
-	v = strings.TrimSpace(v)
-	if n := utf8.RuneCountInString(v); n < 1 || n > maxNameLen {
-		return "", wire.Invalid(path, "length", "must be 1 to 40 characters")
-	}
-	if strings.ContainsFunc(v, unicode.IsControl) {
-		return "", wire.Invalid(path, "pattern", "must not contain control characters")
-	}
-	return v, nil
-}
+// checkName trims a display name and checks it with the rule internal/admin shares (wire.CheckName).
+func checkName(path, v string) (string, error) { return wire.CheckName(path, v) }
 
 // cyrillic maps Russian and Ukrainian letters to Latin for person ids ("Роман" → "roman").
 var cyrillic = map[rune]string{

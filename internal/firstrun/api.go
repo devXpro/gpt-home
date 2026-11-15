@@ -92,8 +92,12 @@ func (s *Server) state(w http.ResponseWriter, r *http.Request) error {
 	return nil
 }
 
-// connect is POST /api/firstrun/relay. A code for another domain is fine here: nobody has a passkey yet, so no
-// passkey can be locked out by the new relying party ID.
+var errRelayConfigured = wire.Errorf(http.StatusConflict, "conflict",
+	"homed already has a relay; change it on the home box with `homed relay connect -`")
+
+// connect is POST /api/firstrun/relay: the relay code of a home that has none yet. A configured relay is never
+// replaced from this plain-http page (409 conflict); that is `homed relay connect -` on the home box, or a step-up in
+// the admin. Any domain is fine for the first one: nobody has a passkey yet that a new relying party could lock out.
 func (s *Server) connect(w http.ResponseWriter, r *http.Request) error {
 	var body struct {
 		Code string `json:"code"`
@@ -106,11 +110,19 @@ func (s *Server) connect(w http.ResponseWriter, r *http.Request) error {
 		return wire.Invalid("/code", "invalid", err.Error()) // ParseCode errors never contain the token
 	}
 	ctx := r.Context()
+	client := clientOf(r)
+	s.connectMu.Lock()
+	defer s.connectMu.Unlock()
+	if s.relay.Domain() != "" {
+		s.log.Warn("firstrun: a relay code was refused, homed has a relay", "client", client)
+		return errRelayConfigured
+	}
 	if err := s.relay.Connect(context.WithoutCancel(ctx), code); err != nil {
 		return fmt.Errorf("firstrun: connect the relay: %w", err)
 	}
-	s.record(ctx, store.AuditRecord{At: s.now(), Via: "admin", Action: "relay.change", Target: code.Domain, OK: true})
-	s.log.Info("firstrun: relay code applied", "domain", code.Domain)
+	s.record(ctx, store.AuditRecord{At: s.now(), Via: "admin", Action: "relay.change", Target: code.Domain, OK: true,
+		Args: clientDetails(client)})
+	s.log.Info("firstrun: relay code applied", "domain", code.Domain, "client", client)
 	rs, _ := s.relayStatus()
 	wire.WriteJSON(w, http.StatusAccepted, rs)
 	return nil
@@ -119,7 +131,8 @@ func (s *Server) connect(w http.ResponseWriter, r *http.Request) error {
 var errRelayNotReady = wire.Errorf(http.StatusConflict, "relay_not_ready",
 	"the relay is not connected yet, or https://<domain> does not reach this hub")
 
-// link is POST /api/firstrun/link: a new setup link for the relay domain. Every call revokes the older links.
+// link is POST /api/firstrun/link: a new setup link for the relay domain, valid LinkTTL (3 minutes). Every call
+// revokes the older links and changes the PIN.
 func (s *Server) link(w http.ResponseWriter, r *http.Request) error {
 	if err := wire.Decode(w, r, &struct{}{}); err != nil {
 		return err
@@ -128,12 +141,22 @@ func (s *Server) link(w http.ResponseWriter, r *http.Request) error {
 	if !ready {
 		return errRelayNotReady
 	}
-	l, err := auth.NewSetupLink(r.Context(), s.st, s.audit, auth.ForDomain(rs.Domain).Origin, "admin", s.now())
+	client := clientOf(r)
+	l, err := auth.NewSetupLink(r.Context(), s.st, s.audit,
+		auth.LinkRequest{Origin: auth.ForDomain(rs.Domain).Origin, Via: "admin", Client: client, TTL: LinkTTL}, s.now())
 	if err != nil {
 		return err
 	}
+	s.log.Info("firstrun: setup link issued", "client", client, "expires", l.ExpiresAt)
+	s.rotatePIN("a setup link was issued")
 	wire.WriteJSON(w, http.StatusOK, map[string]string{"url": l.URL, "expiresAt": wire.Time(l.ExpiresAt)})
 	return nil
+}
+
+// clientDetails names the client in an audit record.
+func clientDetails(client string) []byte {
+	b, _ := wire.Marshal(map[string]string{"client": client})
+	return b
 }
 
 // events is GET /api/firstrun/events: server-sent "relay" events with the full RelayStatus whenever it changes. It
@@ -182,7 +205,7 @@ func (s *Server) events(w http.ResponseWriter, r *http.Request) error {
 				return nil
 			}
 		case <-ping.C:
-			if ready, err := auth.OwnerReady(ctx, s.st); err != nil || ready {
+			if ready, err := auth.OwnerReady(ctx, s.st, s.rpID()); err != nil || ready || s.isClosed() {
 				return nil
 			}
 			if _, err := io.WriteString(w, ": ping\n\n"); err != nil {

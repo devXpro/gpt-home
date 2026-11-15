@@ -13,13 +13,25 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      # setup-go v6 installs the go.mod toolchain directive (a patched go1.26.x), not the bare go line.
+      - uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
       - uses: golangci/golangci-lint-action@v8
         with:
           version: v2.12.2
       - run: go test -race ./...
+
+  # Known vulnerabilities reachable from our code, in the standard library of the toolchain above and in every module.
+  vuln:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+      - run: go version
+      - run: go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 ./...
 
   web:
     runs-on: ubuntu-latest

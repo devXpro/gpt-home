@@ -3,6 +3,7 @@ package auth
 import (
 	"context"
 	"crypto/subtle"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -94,7 +95,7 @@ type Auth struct {
 	log        *slog.Logger
 	now        func() time.Time
 	ceremonies *ceremonies
-	limit      *limiter // the auth endpoints of ADMIN-API §1.7
+	limits     limits // the auth endpoints of ADMIN-API §1.7
 }
 
 // New returns an Auth.
@@ -115,7 +116,7 @@ func New(o Options) (*Auth, error) {
 		st: o.Store, rp: o.RelyingParty, audit: o.Audit, onEnd: o.OnSessionEnd, onSetup: o.OnSetup,
 		version: o.Version, features: o.Features, log: o.Log, now: o.Now,
 		ceremonies: newCeremonies(),
-		limit:      newLimiter(authPerAddress, authTotal),
+		limits:     newLimits(),
 	}, nil
 }
 
@@ -262,6 +263,17 @@ func (a *Auth) writeError(w http.ResponseWriter, r *http.Request, err error) {
 			"request", w.Header().Get(wire.RequestIDHeader), "err", err)
 	}
 	wire.WriteError(w, err)
+}
+
+// clientDetails is an audit record's details naming the client address a request came from (ClientAddr); nil when
+// it is unknown.
+func clientDetails(r *http.Request) json.RawMessage {
+	addr := ClientAddr(r)
+	if addr == "" {
+		return nil
+	}
+	b, _ := wire.Marshal(map[string]string{"client": addr})
+	return b
 }
 
 // record writes an admin audit record. Records outlive the request, so a client that disconnects cannot drop them.

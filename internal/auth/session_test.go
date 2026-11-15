@@ -300,39 +300,153 @@ func TestRequestFormat(t *testing.T) {
 	}
 }
 
-func TestRateLimit(t *testing.T) {
+// auth/token and registration: every request counts, per client address and in total (ADMIN-API §1.7).
+func TestRateLimitTokens(t *testing.T) {
 	e := newEnv(t)
 	b := e.browser()
 	b.xff = "203.0.113.7, 172.18.0.2" // the client as Caddy appended it, then Caddy as frps saw it
-	for range authPerAddress {
-		wantStatus(t, b.do(http.MethodPost, "/api/admin/auth/login/begin", map[string]any{}), http.StatusOK)
+	token := map[string]any{"token": "x"}
+	for range tokenPerAddress {
+		wantError(t, b.do(http.MethodPost, "/api/admin/auth/token", token), http.StatusNotFound, "token_invalid")
 	}
-	rec := b.do(http.MethodPost, "/api/admin/auth/login/begin", map[string]any{})
+	rec := b.do(http.MethodPost, "/api/admin/auth/token", token)
 	wantError(t, rec, http.StatusTooManyRequests, "rate_limited")
 	if after, _ := strconv.Atoi(rec.Header().Get("Retry-After")); after != 3 {
 		t.Fatalf("Retry-After %q", rec.Header().Get("Retry-After"))
 	}
-	// A spoofed left-most value does not give the same client a new bucket.
+	// A spoofed left-most value does not give the same client a new bucket; registration shares the class.
 	b.xff = "198.51.100.1, 203.0.113.7, 172.18.0.2"
-	wantError(t, b.do(http.MethodPost, "/api/admin/auth/token", map[string]any{"token": "x"}), http.StatusTooManyRequests, "rate_limited")
+	wantError(t, b.do(http.MethodPost, "/api/admin/auth/register/begin", token), http.StatusTooManyRequests, "rate_limited")
+	// The class is its own: the same client still signs in.
+	wantStatus(t, b.do(http.MethodPost, "/api/admin/auth/login/begin", map[string]any{}), http.StatusOK)
 	// Another client is not affected; a token comes back after 3 s.
 	other := e.browser()
 	other.xff = "203.0.113.8, 172.18.0.2"
-	wantStatus(t, other.do(http.MethodPost, "/api/admin/auth/login/begin", map[string]any{}), http.StatusOK)
+	wantError(t, other.do(http.MethodPost, "/api/admin/auth/token", token), http.StatusNotFound, "token_invalid")
 	e.clock.Add(3*time.Second + time.Millisecond)
-	wantStatus(t, b.do(http.MethodPost, "/api/admin/auth/login/begin", map[string]any{}), http.StatusOK)
+	wantError(t, b.do(http.MethodPost, "/api/admin/auth/token", token), http.StatusNotFound, "token_invalid")
 
-	// 60 a minute in total, whatever the addresses: 60 - 20 (b) - 1 (other) + 3 (refilled in 3 s) - 1 (b) = 41 left.
+	// 60 a minute in total over the internet's addresses: 60 - 20 (b) - 1 (other) + 3 (refilled in 3 s) - 1 (b) = 41.
 	for i := range 41 {
 		c := e.browser()
 		c.xff = "198.51.100." + strconv.Itoa(i) + ", 172.18.0.2"
-		wantStatus(t, c.do(http.MethodPost, "/api/admin/auth/login/begin", map[string]any{}), http.StatusOK)
+		wantError(t, c.do(http.MethodPost, "/api/admin/auth/token", token), http.StatusNotFound, "token_invalid")
 	}
 	c := e.browser()
 	c.xff = "192.0.2.1, 172.18.0.2"
-	wantError(t, c.do(http.MethodPost, "/api/admin/auth/login/begin", map[string]any{}), http.StatusTooManyRequests, "rate_limited")
+	wantError(t, c.do(http.MethodPost, "/api/admin/auth/token", token), http.StatusTooManyRequests, "rate_limited")
+	// A request without a client address (loopback, no X-Forwarded-For) has its own bucket, outside the total.
+	local := e.browser()
+	wantError(t, local.do(http.MethodPost, "/api/admin/auth/token", token), http.StatusNotFound, "token_invalid")
+	// Sign-in is a class of its own and has no shared bucket: the spent total does not stop it.
+	wantStatus(t, c.do(http.MethodPost, "/api/admin/auth/login/begin", map[string]any{}), http.StatusOK)
 	// Logout is not an auth ceremony and is not limited.
 	wantError(t, c.do(http.MethodPost, "/api/admin/auth/logout", map[string]any{}), http.StatusUnauthorized, "unauthenticated")
+}
+
+// Sign-in counts begins and failed finishes per client address, with no shared bucket: nobody can spend the owner's.
+func TestRateLimitLogin(t *testing.T) {
+	e := newEnv(t)
+	d := newDevice()
+	owner := e.owner(d)
+	owner.xff = "198.51.100.20, 172.18.0.2"
+	attacker := e.browser()
+	attacker.xff = "203.0.113.7, 172.18.0.2"
+	bogus := map[string]any{"ceremonyId": "nope", "credential": map[string]any{}}
+	for range failuresPerKey {
+		wantError(t, attacker.do(http.MethodPost, "/api/admin/auth/login/finish", bogus), http.StatusBadRequest, "webauthn_failed")
+	}
+	// The address's failures are spent: its finishes and begins wait.
+	wantError(t, attacker.do(http.MethodPost, "/api/admin/auth/login/finish", bogus), http.StatusTooManyRequests, "rate_limited")
+	wantError(t, attacker.do(http.MethodPost, "/api/admin/auth/login/begin", map[string]any{}), http.StatusTooManyRequests, "rate_limited")
+	// The owner signs in from their own address, again and again: successes cost no failure.
+	for range failuresPerKey + 2 {
+		wantStatus(t, owner.login(d), http.StatusOK)
+	}
+	// Many addresses failing do not add up to anything shared.
+	for i := range 50 {
+		c := e.browser()
+		c.xff = "192.0.2." + strconv.Itoa(i) + ", 172.18.0.2"
+		wantError(t, c.do(http.MethodPost, "/api/admin/auth/login/finish", bogus), http.StatusBadRequest, "webauthn_failed")
+	}
+	wantStatus(t, owner.login(d), http.StatusOK)
+	// Begins alone are limited per address too (they hold pending ceremonies).
+	spammer := e.browser()
+	spammer.xff = "203.0.113.9, 172.18.0.2"
+	for range beginsPerKey {
+		wantStatus(t, spammer.do(http.MethodPost, "/api/admin/auth/login/begin", map[string]any{}), http.StatusOK)
+	}
+	wantError(t, spammer.do(http.MethodPost, "/api/admin/auth/login/begin", map[string]any{}), http.StatusTooManyRequests, "rate_limited")
+	wantStatus(t, owner.login(d), http.StatusOK)
+	// Failures refill like everything else.
+	e.clock.Add(time.Minute)
+	wantError(t, attacker.do(http.MethodPost, "/api/admin/auth/login/finish", bogus), http.StatusBadRequest, "webauthn_failed")
+}
+
+// Step-up and another passkey are limited per session, never by anonymous traffic.
+func TestRateLimitStepUpPerSession(t *testing.T) {
+	e := newEnv(t)
+	d := newDevice()
+	owner := e.owner(d)
+	// The anonymous internet spends every public bucket it can, from the owner's own relay address too.
+	for i := range 80 {
+		c := e.browser()
+		c.xff = "203.0.113." + strconv.Itoa(i) + ", 172.18.0.2"
+		c.do(http.MethodPost, "/api/admin/auth/token", map[string]any{"token": "x"})
+		c.do(http.MethodPost, "/api/admin/auth/login/finish", map[string]any{"ceremonyId": "nope", "credential": map[string]any{}})
+	}
+	for range 200 {
+		e.browser().do(http.MethodPost, "/api/admin/auth/login/begin", map[string]any{}) // the owner's "local" address
+	}
+	wantStatus(t, owner.stepUp(d), http.StatusOK)
+
+	// A second session (a thief with a stolen cookie but no passkey, say) spends only its own step-up.
+	other := e.browser()
+	other.xff = "198.51.100.30, 172.18.0.2"
+	wantStatus(t, other.login(d), http.StatusOK)
+	bogus := map[string]any{"ceremonyId": "nope", "credential": map[string]any{}}
+	for range failuresPerKey {
+		wantError(t, other.do(http.MethodPost, "/api/admin/auth/stepup/finish", bogus), http.StatusBadRequest, "webauthn_failed")
+	}
+	wantError(t, other.do(http.MethodPost, "/api/admin/auth/stepup/finish", bogus), http.StatusTooManyRequests, "rate_limited")
+	wantError(t, other.do(http.MethodPost, "/api/admin/auth/stepup/begin", map[string]any{}), http.StatusTooManyRequests, "rate_limited")
+	// The other session's spent step-up leaves the passkey ceremonies (their own class) and every other session alone.
+	wantStatus(t, owner.stepUp(d), http.StatusOK)
+	wantStatus(t, other.do(http.MethodPost, "/api/admin/me/passkeys/begin", map[string]any{}), http.StatusOK)
+}
+
+// Pending ceremonies: a public flood replaces the oldest public ones and never crowds out a session's step-up.
+func TestCeremonyPools(t *testing.T) {
+	cs := newCeremonies()
+	now := time.Date(2026, 11, 15, 12, 0, 0, 0, time.UTC)
+	first, ok := cs.add(&ceremony{kind: kindLogin, expires: now.Add(CeremonyTTL)}, now)
+	if !ok {
+		t.Fatal("refused")
+	}
+	for i := range maxCeremonies + 10 {
+		if _, ok := cs.add(&ceremony{kind: kindLogin, expires: now.Add(CeremonyTTL + time.Duration(i+1)*time.Millisecond)}, now); !ok {
+			t.Fatalf("public ceremony %d refused", i)
+		}
+	}
+	if _, ok := cs.take(first, now, isKind(kindLogin)); ok {
+		t.Fatal("the oldest public ceremony survived a full pool")
+	}
+	if len(cs.m) != maxCeremonies {
+		t.Fatalf("%d pending", len(cs.m))
+	}
+	for i := range maxCeremonies {
+		if _, ok := cs.add(&ceremony{kind: kindStepUp, sessionID: "s", expires: now.Add(CeremonyTTL)}, now); !ok {
+			t.Fatalf("step-up %d refused next to a full public pool", i)
+		}
+	}
+	if _, ok := cs.add(&ceremony{kind: kindAddPasskey, sessionID: "s", expires: now.Add(CeremonyTTL)}, now); ok {
+		t.Fatal("a full session pool accepted more")
+	}
+	// Expired ones make room again.
+	later := now.Add(CeremonyTTL + time.Hour)
+	if _, ok := cs.add(&ceremony{kind: kindStepUp, sessionID: "s", expires: later.Add(CeremonyTTL)}, later); !ok || len(cs.m) != 1 {
+		t.Fatalf("expired ceremonies kept: %d pending", len(cs.m))
+	}
 }
 
 func TestClientAddr(t *testing.T) {
@@ -388,7 +502,7 @@ func TestLocalEndpoints(t *testing.T) {
 	if res["revokedPasskeys"] != float64(1) || res["revokedSessions"] != float64(2) || res["url"] == link["url"] {
 		t.Fatalf("reset %v", res)
 	}
-	if ready, _ := OwnerReady(ctx, e.st); ready {
+	if ready, _ := OwnerReady(ctx, e.st, testDomain); ready {
 		t.Fatal("owner still ready after reset")
 	}
 	wantError(t, b.do(http.MethodGet, "/test/session", nil), http.StatusUnauthorized, "unauthenticated")
@@ -426,8 +540,11 @@ func TestOwnerReady(t *testing.T) {
 	ctx := context.Background()
 	check := func(want bool) {
 		t.Helper()
-		if got, err := OwnerReady(ctx, e.st); err != nil || got != want {
+		if got, err := OwnerReady(ctx, e.st, testDomain); err != nil || got != want {
 			t.Fatalf("OwnerReady %v %v, want %v", got, err, want)
+		}
+		if got, err := e.a.OwnerReady(ctx); err != nil || got != want {
+			t.Fatalf("Auth.OwnerReady %v %v, want %v", got, err, want)
 		}
 	}
 	check(false)
@@ -435,12 +552,35 @@ func TestOwnerReady(t *testing.T) {
 	check(false)
 	wantStatus(t, e.browser().register(newDevice(), e.link(), nil), http.StatusCreated)
 	check(true)
+	// Only passkeys of the current relying party count (review L4): after a relay change the old ones open nothing.
+	if got, _ := OwnerReady(ctx, e.st, "other.example.com"); got {
+		t.Fatal("a passkey of another domain counts")
+	}
+	if got, _ := OwnerReady(ctx, e.st, ""); got {
+		t.Fatal("ready without a relying party")
+	}
+	pks, _ := e.st.Passkeys().ListByPerson(ctx, "roman")
+	if len(pks) != 1 || PasskeyRPID(pks[0]) != testDomain || !e.a.UsablePasskey(pks[0]) {
+		t.Fatalf("passkeys %+v", pks)
+	}
+	e.mu.Lock()
+	e.noRP = true
+	e.mu.Unlock()
+	if e.a.UsablePasskey(pks[0]) {
+		t.Fatal("usable without a relying party")
+	}
+	if got, _ := e.a.OwnerReady(ctx); got {
+		t.Fatal("Auth.OwnerReady without a relying party")
+	}
+	if PasskeyRPID(store.Passkey{Credential: []byte("junk")}) != "" {
+		t.Fatal("an unreadable passkey has a relying party")
+	}
 }
 
 func TestNewSetupLinkChecksOrigin(t *testing.T) {
 	st := newEnv(t).st
 	for _, origin := range []string{"", "homie.example.com", "https://homie.example.com/", "https://h/x", "ftp://h", "https://u@h"} {
-		if _, err := NewSetupLink(context.Background(), st, nil, origin, "cli", time.Now()); err == nil {
+		if _, err := NewSetupLink(context.Background(), st, nil, LinkRequest{Origin: origin, Via: "cli"}, time.Now()); err == nil {
 			t.Errorf("origin %q accepted", origin)
 		}
 	}
@@ -484,4 +624,25 @@ func excluded(t *testing.T, raw []byte) []string {
 		ids = append(ids, c.ID)
 	}
 	return ids
+}
+
+// A link from the LAN page lives 3 minutes and its audit record names the client (review M2, L3).
+func TestSetupLinkTTLAndClient(t *testing.T) {
+	e := newEnv(t)
+	ctx := context.Background()
+	now := e.clock.Now()
+	l, err := NewSetupLink(ctx, e.st, nil, LinkRequest{Origin: testOrigin, Via: "admin", Client: "192.168.68.20", TTL: 3 * time.Minute}, now)
+	if err != nil || !l.ExpiresAt.Equal(now.Add(3*time.Minute)) {
+		t.Fatalf("link %+v %v", l, err)
+	}
+	_, token, _ := strings.Cut(l.URL, "#t=")
+	if inv, err := e.st.Invites().GetByTokenHash(ctx, hashToken(token)); err != nil || !inv.ExpiresAt.Equal(now.Add(3*time.Minute)) {
+		t.Fatalf("invite %+v %v", inv, err)
+	}
+	e.clock.Add(3 * time.Minute)
+	wantError(t, e.browser().do(http.MethodPost, "/api/admin/auth/token", map[string]string{"token": token}), http.StatusGone, "token_expired")
+	recs := e.audit()
+	if last := recs[len(recs)-1]; last.Action != "setup.link" || last.Via != "admin" || string(last.Args) != `{"client":"192.168.68.20"}` {
+		t.Fatalf("audit %+v %s", last, last.Args)
+	}
 }

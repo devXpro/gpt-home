@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net/http"
 	"slices"
+	"strings"
 	"time"
 )
 
@@ -52,11 +53,14 @@ type jobEntry struct {
 // jobFunc does the work and returns the plugin id it acted on (install learns it from the release).
 type jobFunc func(ctx context.Context, report Reporter) (target string, err error)
 
-// startJob starts a job unless one of the same kind and target runs (409 job_running).
+// startJob starts a job unless one of the same kind and target runs, or any plugin job (install, update, remove) of
+// the same plugin (409 job_running). The installer also locks per plugin id, for an install whose id comes from the
+// release.
 func (s *Server) startJob(q *request, kind, target string, fn jobFunc) (jobJSON, error) {
 	s.mu.Lock()
 	for _, e := range s.jobs {
-		if e.j.State == "running" && e.j.Kind == kind && e.j.Target == target {
+		samePlugin := strings.HasPrefix(e.j.Kind, "plugin.") && strings.HasPrefix(kind, "plugin.")
+		if e.j.State == "running" && e.j.Target == target && (e.j.Kind == kind || samePlugin) {
 			s.mu.Unlock()
 			return jobJSON{}, &apiError{
 				status: http.StatusConflict, code: "job_running", message: "this is already in progress",

@@ -21,10 +21,12 @@ import { relayLook } from '@/lib/status'
 import type { FirstRunState, RelayStatus, SetupLink } from '@/lib/types'
 
 // The LAN first-run page (DESIGN.md §8.3, ADMIN-API §5), served by homed's setup listener on http://<lan ip>:8090
-// until the home has an owner: PIN → server code → connecting → the one-time setup link.
+// until the home has an owner: PIN → server code → connecting → the one-time setup link. The page closes 30 minutes
+// after homed opened it, or after too many wrong PINs (410 setup_closed); `homed admin firstrun` opens it again.
 
 const FR = { base: '/api/firstrun' }
 const STATE_KEY = ['firstrun', 'state'] as const
+const PIN_LENGTH = 8
 
 export function LanSetup() {
   const { t } = useTranslation()
@@ -43,7 +45,13 @@ export function LanSetup() {
 
   let content
   if (state.error) {
-    content = isApiError(state.error, 'setup_done') ? <Done /> : <ErrorState text={errorText(state.error, t)} onRetry={refresh} />
+    content = isApiError(state.error, 'setup_done') ? (
+      <Done />
+    ) : isApiError(state.error, 'setup_closed') ? (
+      <Closed />
+    ) : (
+      <ErrorState text={errorText(state.error, t)} onRetry={refresh} />
+    )
   } else if (!state.data) {
     content = (
       <div className="flex justify-center py-16">
@@ -85,6 +93,18 @@ function Done() {
   )
 }
 
+/** Closed: the page timed out or saw too many wrong PINs; only the home computer can open it again. */
+function Closed() {
+  const { t } = useTranslation()
+  return (
+    <div className="flex flex-col items-center gap-4 py-6">
+      <StatusOrb tone="warning" />
+      <p className="type-title-3 text-balance">{t('lan.closed.title')}</p>
+      <p className="type-callout text-label-2 text-balance">{t('lan.closed.text')}</p>
+    </div>
+  )
+}
+
 function PinStep({ onDone }: { onDone: () => void }) {
   const { t } = useTranslation()
   const [pin, setPin] = useState('')
@@ -116,6 +136,8 @@ function PinStep({ onDone }: { onDone: () => void }) {
       if (isApiError(err, 'wrong_pin')) {
         setWrong(true)
         void shake.start({ x: [0, -8, 8, -4, 4, 0], transition: { duration: 0.3 } })
+      } else if (isApiError(err, 'setup_closed')) {
+        onDone()
       } else if (isApiError(err, 'rate_limited')) {
         setWrong(false)
         setLockedUntil(Date.now() + (err.retryAfter ?? 600) * 1000)
@@ -137,17 +159,17 @@ function PinStep({ onDone }: { onDone: () => void }) {
           ref={input}
           value={pin}
           onChange={(e) => {
-            const v = e.target.value.replace(/\D/g, '').slice(0, 6)
+            const v = e.target.value.replace(/\D/g, '').slice(0, PIN_LENGTH)
             setPin(v)
             setWrong(false)
-            if (v.length === 6 && !busy) void submit(v)
+            if (v.length === PIN_LENGTH && !busy) void submit(v)
           }}
           onFocus={() => setFocused(true)}
           onBlur={() => setFocused(false)}
           inputMode="numeric"
           autoComplete="one-time-code"
           pattern="[0-9]*"
-          maxLength={6}
+          maxLength={PIN_LENGTH + 1} // room for a pasted "1234 5678"; onChange keeps the digits
           disabled={busy || locked}
           aria-label={t('lan.pin.title')}
           aria-invalid={wrong || undefined}
@@ -155,22 +177,28 @@ function PinStep({ onDone }: { onDone: () => void }) {
           autoFocus
           className="absolute inset-0 z-10 h-full w-full cursor-text text-transparent caret-transparent opacity-0 outline-none disabled:cursor-not-allowed"
         />
-        <div aria-hidden className={cn('flex gap-2', locked && 'opacity-40')}>
-          {Array.from({ length: 6 }, (_, i) => {
-            const active = focused && !locked && i === Math.min(pin.length, 5)
-            return (
-              <span
-                key={i}
-                className={cn(
-                  'flex h-14 w-11 items-center justify-center rounded-md bg-fill font-mono text-[28px] font-semibold tabular-nums transition-[box-shadow]',
-                  active && 'shadow-[0_0_0_2px_var(--accent)]',
-                  wrong && 'shadow-[0_0_0_2px_var(--danger)]',
-                )}
-              >
-                {pin[i] ?? ''}
-              </span>
-            )
-          })}
+        {/* Eight boxes in two groups of four, as homed prints the PIN ("1234 5678"); narrow enough for a phone. */}
+        <div aria-hidden className={cn('flex gap-3 sm:gap-4', locked && 'opacity-40')}>
+          {[0, 4].map((start) => (
+            <div key={start} className="flex gap-1.5 sm:gap-2">
+              {Array.from({ length: 4 }, (_, j) => {
+                const i = start + j
+                const active = focused && !locked && i === Math.min(pin.length, PIN_LENGTH - 1)
+                return (
+                  <span
+                    key={i}
+                    className={cn(
+                      'flex h-14 w-8 items-center justify-center rounded-md bg-fill font-mono text-[24px] font-semibold tabular-nums transition-[box-shadow] sm:w-10 sm:text-[28px]',
+                      active && 'shadow-[0_0_0_2px_var(--accent)]',
+                      wrong && 'shadow-[0_0_0_2px_var(--danger)]',
+                    )}
+                  >
+                    {pin[i] ?? ''}
+                  </span>
+                )
+              })}
+            </div>
+          ))}
         </div>
       </motion.div>
       <div id="pin-note" className="mt-5 min-h-10" role="status" aria-live="polite">
@@ -202,7 +230,9 @@ function CodeStep({ onDone }: { onDone: () => void }) {
       await api.post<RelayStatus>('/relay', { code: c }, FR)
       onDone()
     } catch (err) {
-      setError(isApiError(err, 'invalid_args') ? t('lan.code.invalid') : errorText(err, t))
+      // conflict: homed has a server already (set from the home computer meanwhile); move on to it.
+      if (isApiError(err, 'conflict')) onDone()
+      else setError(isApiError(err, 'invalid_args') ? t('lan.code.invalid') : errorText(err, t))
     } finally {
       setBusy(false)
     }
@@ -270,7 +300,7 @@ function ConnectStep({ initial, onGone }: { initial?: RelayStatus; onGone: () =>
     try {
       setLink(await api.post<SetupLink>('/link', {}, FR))
     } catch (err) {
-      if (isApiError(err, 'setup_done')) onGone()
+      if (isApiError(err, 'setup_done') || isApiError(err, 'setup_closed')) onGone()
       else if (!isApiError(err, 'relay_not_ready')) setLinkError(errorText(err, t))
     }
   }
@@ -283,7 +313,7 @@ function ConnectStep({ initial, onGone }: { initial?: RelayStatus; onGone: () =>
       .then((l) => live && setLink(l))
       .catch((err: unknown) => {
         if (!live) return
-        if (isApiError(err, 'setup_done')) onGone()
+        if (isApiError(err, 'setup_done') || isApiError(err, 'setup_closed')) onGone()
         else if (!isApiError(err, 'relay_not_ready')) setLinkError(errorText(err, t))
       })
     return () => {
