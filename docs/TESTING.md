@@ -60,3 +60,17 @@ negotiation, the tool-list fingerprint, forwarding with the bearer key, and the 
 ```sh
 make site-test
 ```
+
+### Gateway, keys and audit (`internal/gateway`, `internal/keys`, `internal/audit`)
+
+Covers PLAN §5.4 with `httptest` and a fake `ToolHost`: bearer auth (missing, wrong, right), per-person plugin scopes on
+the list and on calls, every row of the REST status table, the `/api/v1/tools` golden manifest
+(`internal/gateway/testdata/tools.golden.json`, checked against the keys `librus-gpt/site/core/mcp.mjs` reads), MCP
+list and call through a go-sdk client over HTTP, the `serverInfo.version` fingerprint following tool changes, the
+per-key rate limit (fake clock), audit entries and redaction, key generation and constant-time matching, and the JSONL
+audit files (monthly names, 0600, drop-on-overflow). No network.
+
+```sh
+go test -race ./internal/gateway/... ./internal/keys/... ./internal/audit/...
+go test ./internal/gateway/ -run TestManifestGolden -update   # rewrite the golden after an intended change
+```
