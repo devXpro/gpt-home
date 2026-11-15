@@ -44,8 +44,10 @@ makes no ChatGPT or Codex call. Never run `release.mjs` without `--dry-run` as a
 ## Web tests
 
 ```sh
-make web   # no-op until web/ exists
+make web   # npm ci + vite build into internal/web/dist (embedded by homed)
 ```
+
+The admin SPA's own suites (typecheck, lint, Vitest, Playwright) are described under "Admin UI" below.
 
 ## Suites
 
@@ -231,3 +233,31 @@ the URL and PIN. About 3 s.
 ```sh
 go test -race ./internal/auth/... ./internal/firstrun/...
 ```
+
+### Admin UI (`web/`, `internal/web`)
+
+Everything runs against the mock API in `web/src/mocks` (MSW 3, the whole of `docs/ADMIN-API.md` including SSE, the
+LAN first-run API and a fake gpt-tv with progress); scenarios are picked with `?mock=<name>`
+(`web/src/mocks/data.ts`). No homed, no network after `npm ci` and `npx playwright install chromium`.
+
+- `npm --prefix web run typecheck` and `npm --prefix web run lint` (the CI web job runs both, then the build).
+- `npm --prefix web test` — Vitest (jsdom, about 1 s): the JSON Schema → form rules of DESIGN.md §9.3 (every control,
+  ordering, labels from `i18n`, defaults, arguments, validation words, server `invalid_args`), the SchemaForm
+  component (device picker with "Другое…", slider, segmented control with arrow keys, select, secret toggle, switch,
+  chips, checklist, JSON editor, nested object, folding), tool grouping (§9.2) and RU/EN key and placeholder parity.
+- `npm --prefix web run e2e` — Playwright smoke (Chromium, about 1 min). It builds the mock bundle and serves it with
+  `vite preview` under the production CSP (`internal/web/csp.txt`); any CSP violation or page error fails a test.
+  Sign-in and the first-run wizard use Chrome's virtual authenticator (real WebAuthn ceremonies); also an admin tool
+  with progress (`tv_pair`), form validation and a failed run with retry, discovery → add from the result, step-up
+  before creating a key, the LAN page (PIN, lock after five wrong PINs, connecting, QR link), the offline home, a
+  destructive action's confirmation, no layout shift while navigating, and axe (WCAG 2.1 AA) on eight screens in
+  both themes.
+- `npm --prefix web run screenshots` — regenerates `docs/screenshots/*.webp` (git-ignored; a curated set is committed in `docs/images/`) (63 screens × dark/light ×
+  phone 390×844 / desktop 1440×900, about 10 min). `-- --grep "phone dark"` narrows it.
+- `go test -race ./internal/web/...` — the Go handler: SPA fallback for client routes (`/admin/...`, `/firstrun`,
+  `/join`), immutable hashed assets, 404 (not HTML) for missing assets, dotfiles never served, ETag/304, gzip and
+  `q=0`, HEAD, 405, the CSP and security headers, the 503 hint before `make web`, and the embedded build.
+
+Manual: `npm --prefix web run dev:mock` serves the mock app at http://localhost:5173/admin/ (`/firstrun` for the LAN
+page, PIN 123456); `npm --prefix web run dev` proxies `/api` to a homed on 127.0.0.1:8080 started with
+`--dev-origin http://localhost:5173`.

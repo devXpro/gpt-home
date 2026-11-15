@@ -1,0 +1,5 @@
+node_modules/
+.mock-dist/
+test-results/
+playwright-report/
+*.tsbuildinfo
