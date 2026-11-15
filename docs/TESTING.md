@@ -171,3 +171,19 @@ races that must have one winner (the last two passkeys, one setup token), concur
 ```sh
 go test -race ./internal/store/...
 ```
+
+### Plugin installer and homed self-update (`internal/install`)
+
+Runs against an httptest TLS fake of the GitHub Releases API and the asset host (no real network, no Docker): release
+resolving (latest, by version, `v` and bare tags, prerelease and draft handling, rate limit and 404 mapping), asset
+choice by the GoReleaser name (incl. armv7), checksum verification (mismatch, missing file, missing line), the full
+install and update flows with their job steps, start failure with rollback, same-version replacement, pruning and
+removal, the size limits (advertised and streamed), https-only incl. a redirect to plain http, the token going only to
+the API host and never into errors, and the archive guard (`..`, absolute and backslash names, escaping symlinks, hard
+links, devices, duplicates, entry and size caps, a gzip bomb, mode normalization). The homed self-update replaces a
+fake executable in a temp dir (swap, `.prev` backup, rollback, failing self-test, read-only directory, symlinked
+executable). About 2 s.
+
+```sh
+go test -race ./internal/install/...
+```
