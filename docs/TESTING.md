@@ -94,18 +94,17 @@ Prerequisites: Docker with compose v2 and the images `ghcr.io/fatedier/frps:v0.7
 `caddy:2.11.4-alpine`, `alpine:3.21`, `curlimages/curl:8.11.1` (pulled on first run), Go (builds `relay/test/echo`),
 openssl. No root, no network except image pulls, nothing on the host ports.
 
-### Relay client and homed spike (`internal/relay`, `internal/spike`, `cmd/homed`)
+### Relay client (`internal/relay`)
 
 Unit tests (no network, no Docker): connect code round trip and every parse error (tokens never in errors); the frp
 client settings of PLAN §5.5 (wss on 443, TLS name = domain, system roots or only the CA file, `loginFailExit = false`,
 one `http` proxy `homed` → `127.0.0.1:<port>`); the guard that refuses frp's default of not verifying the server
 certificate; the frp log bridge; the real embedded client retrying against a closed port and stopping cleanly;
-`SelfCheck` against an `httptest` TLS server (our id, another hub, not a hub, home offline, untrusted certificate); the
-spike REST façade, auth and `X-GPT-Home-Instance` on every response; `/mcp` through a go-sdk client with a relayed
-(non-loopback) Host; `homed relay connect` (homed.yaml kept, token 0600, stdin `-`) and the CLI checks.
+`SelfCheck` against an `httptest` TLS server (our id, another hub, not a hub, home offline, untrusted certificate).
+(The phase 0 spike package and its tests were removed in T1.3; `homed relay connect` is covered by the homed suite.)
 
 ```sh
-go test -race ./internal/relay/... ./internal/spike/... ./cmd/homed/...
+go test -race ./internal/relay/...
 ```
 
 Integration test (Docker): the embedded client against the real `ghcr.io/fatedier/frps:v0.72.0` with the §5.5 config,
@@ -118,7 +117,8 @@ cut (with `Status.Since` moving), and that an untrusted certificate and a wrong 
 go test -race -tags integration -run Integration ./internal/relay/
 ```
 
-The manual check of `homed run --spike` behind real Caddy is in `docs/research/frp-embedding.md` ("Local acceptance run").
+The manual check behind real Caddy is in `docs/research/frp-embedding.md` ("Local acceptance run"); since T1.3 run
+`homed run` without `--spike` there and call a plugin tool with a person key instead of `home_ping`.
 
 ### pluginkit and the plugin host (`pluginkit/`, `internal/plugins/`)
 
@@ -133,4 +133,27 @@ About 5 s; no network.
 
 ```sh
 go test -race ./pluginkit/... ./internal/plugins/...
+```
+
+### homed and its config (`cmd/homed`, `internal/config`)
+
+`internal/config`: loading and validating `homed.yaml` (unknown keys, loopback-only listen, relay domain, plugin and
+person ids, scopes, key hashes, duplicates), `Update` rewriting only changed top-level sections (comments and untouched
+sections survive; failed updates write nothing; 0600), the relay token (0600, loose modes refused), the instance id
+and the data dir resolution.
+
+`cmd/homed`: the CLI (`relay connect` incl. stdin, `key new/list/revoke`, `key new --keychain` against a fake
+`security` that must receive the key on stdin and never in argv, `plugin add/list/remove`, flags after positionals,
+commands needing a running homed), and the Host allowlist (relay domain with any port, `127.0.0.1`/`localhost`/`[::1]`
+with our port, 421 otherwise). `TestDaemon` is the T1.3 acceptance: it builds the fake plugin, runs `serve` in-process
+with a relay pointed at a closed local port, then: `key new` on the running homed (picked up at once over the socket),
+`GET /api/v1/tools` with that key (assistant tools of the person's scope only), the relay Host passing and a foreign
+Host getting 421, `tool list`/`tool call` through the socket (admin tools included, caller `admin` via `cli`, a failing
+tool exits 1, unknown tool, non-object arguments), `plugin list`, `relay status`, a second homed refused on the same data
+dir, `key revoke` taking effect at once, a clean shutdown removing the socket, and the audit lines with redaction. The
+tests set `HOMED_DATA_DIR` to a temp dir, so nothing touches the real data dir; data dirs live under `/tmp` because a
+unix socket path must fit in 103 bytes. About 2 s; no network, no Docker.
+
+```sh
+go test -race ./cmd/homed/... ./internal/config/...
 ```

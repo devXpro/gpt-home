@@ -42,6 +42,9 @@ func (c Code) Validate() error {
 	return nil
 }
 
+// ValidateDomain reports whether d is usable as the relay domain.
+func ValidateDomain(d string) error { return validateDomain(d) }
+
 // validateDomain accepts a lowercase DNS name with at least two labels, without scheme, port or path.
 func validateDomain(d string) error {
 	if len(d) > 253 || !domainRE.MatchString(d) {

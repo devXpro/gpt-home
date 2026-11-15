@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"errors"
-	"flag"
 	"fmt"
 	"io"
 	"log/slog"
@@ -12,126 +11,253 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
-	"strconv"
+	"slices"
 	"sync"
 	"syscall"
 	"time"
 
+	"github.com/devXpro/gpt-home/internal/audit"
+	"github.com/devXpro/gpt-home/internal/config"
+	"github.com/devXpro/gpt-home/internal/gateway"
+	"github.com/devXpro/gpt-home/internal/keys"
+	"github.com/devXpro/gpt-home/internal/plugins"
 	"github.com/devXpro/gpt-home/internal/relay"
-	"github.com/devXpro/gpt-home/internal/spike"
 )
 
 const (
-	defaultListen     = "127.0.0.1:8080"
 	selfCheckInterval = 30 * time.Second
+	shutdownTimeout   = 5 * time.Second
 )
 
+// runOptions are the `homed run` settings.
+type runOptions struct {
+	dataDir    string
+	listen     string // overrides homed.yaml
+	caFile     string // test harness only
+	serverAddr string // test harness only
+	ready      func(*daemon)
+}
+
+// daemon is a running homed.
+type daemon struct {
+	dir        string
+	log        *slog.Logger
+	instanceID string
+	host       *plugins.Host
+	resolver   *keys.Resolver
+	audit      *audit.Log
+	relay      *relay.Client // nil when no relay is configured
+	relayCfg   relay.Config
+	httpAddr   net.Addr
+
+	mu        sync.Mutex
+	cfg       *config.Config // as loaded at start or at the last reload
+	selfCheck selfCheckResult
+}
+
+type selfCheckResult struct {
+	at  time.Time
+	err string // "" when it passed
+}
+
 func cmdRun(args []string, stderr io.Writer) error {
-	fl := flag.NewFlagSet("run", flag.ContinueOnError)
-	fl.SetOutput(stderr)
-	dataDir := fl.String("data-dir", "", "data directory (default: platform data dir, or HOMED_DATA_DIR)")
-	listen := fl.String("listen", "", "loopback address to serve on (default: homed.yaml listen, else "+defaultListen+")")
-	spikeMode := fl.Bool("spike", false, "serve the phase 0 spike endpoints (the only mode so far)")
-	authlessMCP := fl.Bool("spike-authless-mcp", false, "serve /mcp WITHOUT auth (connection test of path A only)")
+	fl, dataDir := newFlags("run", stderr)
+	listen := fl.String("listen", "", "loopback address to serve on (default: homed.yaml listen, else "+config.DefaultListen+")")
 	caFile := fl.String("relay-ca-file", "", "test harness only: trust only this PEM CA for the relay")
 	serverAddr := fl.String("relay-server-addr", "", "test harness only: dial this host:port instead of <domain>:443")
-	if err := fl.Parse(args); err != nil {
+	pos, err := parseFlags(fl, args)
+	if err != nil {
 		return err
 	}
-	if fl.NArg() > 0 {
-		return fmt.Errorf("unexpected arguments: %v", fl.Args())
+	if len(pos) > 0 {
+		return fmt.Errorf("unexpected arguments: %v", pos)
 	}
-	if !*spikeMode {
-		return errors.New("only the spike exists in this build: run with --spike")
-	}
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	return serve(ctx, runOptions{dataDir: *dataDir, listen: *listen, caFile: *caFile, serverAddr: *serverAddr}, newLogger(stderr))
+}
 
-	log := newLogger(stderr)
-	dir, err := resolveDataDir(*dataDir)
+// serve runs homed until ctx is done: the gateway on the listen address, the plugins, the relay client with its
+// self-check, and the local admin socket. SIGHUP reloads the people and keys from homed.yaml.
+func serve(ctx context.Context, opts runOptions, log *slog.Logger) error {
+	dir, err := config.ResolveDataDir(opts.dataDir)
 	if err != nil {
 		return err
 	}
-	cfg, err := loadConfig(dir)
+	cfg, err := config.Load(dir)
 	if err != nil {
 		return err
 	}
-	id, err := instanceID(dir)
+	id, err := config.InstanceID(dir)
 	if err != nil {
 		return fmt.Errorf("instance id: %w", err)
 	}
-
-	addr := *listen
-	if addr == "" {
-		addr = cfg.Listen
+	addr := cfg.ListenAddr()
+	if opts.listen != "" {
+		addr = opts.listen
 	}
-	if addr == "" {
-		addr = defaultListen
-	}
-	port, err := loopbackPort(addr)
+	port, err := config.LoopbackPort(addr)
 	if err != nil {
 		return err
 	}
-
-	key := os.Getenv("HOMED_SPIKE_KEY")
-	if key == "" {
-		log.Warn("HOMED_SPIKE_KEY is empty: every /api/v1/tools call will answer 401")
+	resolver, err := keys.New(cfg.KeyEntries())
+	if err != nil {
+		return fmt.Errorf("%s: %w", config.FileName, err)
 	}
-	if *authlessMCP {
-		log.Warn("/mcp is served WITHOUT auth (--spike-authless-mcp); use only for the path A connection test")
+	d := &daemon{dir: dir, log: log, instanceID: id, resolver: resolver, cfg: cfg}
+
+	var relayToken string
+	if cfg.Relay.Domain != "" {
+		if relayToken, err = config.ReadRelayToken(dir); err != nil {
+			return fmt.Errorf("relay token: %w", err)
+		}
 	}
 
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
-
-	ln, err := (&net.ListenConfig{}).Listen(ctx, "tcp", addr)
+	// The socket comes first: it also refuses a second homed on the same data dir.
+	sockLn, err := listenSocket(ctx, filepath.Join(dir, config.SocketFile))
 	if err != nil {
 		return err
 	}
-	srv := &http.Server{
-		Handler: spike.New(spike.Options{
-			InstanceID: id, Key: key, AuthlessMCP: *authlessMCP, Version: version, Logger: log,
-		}),
-		ReadHeaderTimeout: 10 * time.Second,
+	defer sockLn.Close()
+	httpLn, err := (&net.ListenConfig{}).Listen(ctx, "tcp", addr)
+	if err != nil {
+		return err
 	}
+	defer httpLn.Close()
+	d.httpAddr = httpLn.Addr()
+
+	if d.audit, err = audit.Open(filepath.Join(dir, config.AuditDir), log.With("component", "audit")); err != nil {
+		return err
+	}
+	defer func() {
+		if err := d.audit.Close(); err != nil {
+			log.Error("audit log", "err", err)
+		}
+		if n := d.audit.Dropped(); n > 0 {
+			log.Warn("audit entries dropped", "count", n)
+		}
+	}()
+
+	specs := make([]plugins.Spec, 0, len(cfg.Plugins))
+	for _, p := range cfg.Plugins {
+		specs = append(specs, plugins.Spec{ID: p.ID, Command: p.Command})
+	}
+	if d.host, err = plugins.New(specs, dir, log.With("component", "plugins")); err != nil {
+		return err
+	}
+	d.host.HubVersion = version
+	d.host.Start(ctx)
+	defer d.host.Close()
+
+	gw := gateway.New(d.host, resolver, d.audit, gateway.Options{
+		HomeName:     cfg.HomeName,
+		Instructions: d.host.Instructions,
+		InstanceID:   id,
+		Version:      version,
+	})
+	httpSrv := &http.Server{Handler: hostGuard(cfg.Relay.Domain, port, gw), ReadHeaderTimeout: 10 * time.Second}
+	sockSrv := &http.Server{Handler: d.socketHandler(), ReadHeaderTimeout: 10 * time.Second}
+
 	var wg sync.WaitGroup
 	defer wg.Wait()
-	srvErr := make(chan error, 1)
-	wg.Go(func() { srvErr <- srv.Serve(ln) })
-	log.Info("homed listening", "addr", ln.Addr().String(), "data_dir", dir, "version", version)
+	srvErr := make(chan error, 2)
+	wg.Go(func() { srvErr <- httpSrv.Serve(httpLn) })
+	wg.Go(func() { srvErr <- sockSrv.Serve(sockLn) })
+	log.Info("homed listening", "addr", httpLn.Addr().String(), "data_dir", dir, "version", version,
+		"plugins", len(specs), "people", len(cfg.People))
 
+	runCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
 	if cfg.Relay.Domain == "" {
 		log.Warn("relay not configured; serving locally only (run: homed relay connect <code>)")
 	} else {
-		token, err := readSecretFile(filepath.Join(dir, relayTokenFile))
-		if err != nil {
-			_ = srv.Close()
-			return fmt.Errorf("relay token: %w", err)
+		d.relay = &relay.Client{}
+		d.relayCfg = relay.Config{
+			Domain: cfg.Relay.Domain, Token: relayToken, LocalPort: port, CAFile: opts.caFile, ServerAddr: opts.serverAddr,
 		}
-		rc := relay.Config{
-			Domain: cfg.Relay.Domain, Token: token, LocalPort: port, CAFile: *caFile, ServerAddr: *serverAddr,
-		}
-		var client relay.Client
 		wg.Go(func() {
-			if err := client.Run(ctx, rc, log); err != nil {
+			if err := d.relay.Run(runCtx, d.relayCfg, log); err != nil {
 				log.Error("relay stopped", "err", err)
 			}
 		})
-		wg.Go(func() { selfCheckLoop(ctx, &client, rc, id, log) })
+		wg.Go(func() { d.selfCheckLoop(runCtx) })
 	}
 
+	hup := make(chan os.Signal, 1)
+	signal.Notify(hup, syscall.SIGHUP)
+	defer signal.Stop(hup)
+	wg.Go(func() {
+		for {
+			select {
+			case <-runCtx.Done():
+				return
+			case <-hup:
+				if _, err := d.reload(); err != nil {
+					log.Error("reload failed", "err", err)
+				}
+			}
+		}
+	})
+
+	if opts.ready != nil {
+		opts.ready(d)
+	}
+	var serveErr error
 	select {
-	case err := <-srvErr:
-		stop()
-		return err
+	case serveErr = <-srvErr:
 	case <-ctx.Done():
 	}
 	log.Info("shutting down")
-	shCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	return srv.Shutdown(shCtx)
+	cancel()
+	shCtx, shCancel := context.WithTimeout(context.Background(), shutdownTimeout)
+	defer shCancel()
+	for _, srv := range []*http.Server{httpSrv, sockSrv} {
+		if err := srv.Shutdown(shCtx); err != nil {
+			_ = srv.Close() // a tool call still running (a pairing may take minutes) is cut
+		}
+	}
+	return serveErr
+}
+
+// reload re-reads homed.yaml and applies the people and their keys. Other changes need a restart; their section
+// names are returned and logged.
+func (d *daemon) reload() ([]string, error) {
+	cfg, err := config.Load(d.dir)
+	if err != nil {
+		return nil, err
+	}
+	if err := d.resolver.Update(cfg.KeyEntries()); err != nil {
+		return nil, err
+	}
+	d.mu.Lock()
+	old := d.cfg
+	d.cfg = cfg
+	d.mu.Unlock()
+
+	var restart []string
+	if cfg.HomeName != old.HomeName {
+		restart = append(restart, "home_name")
+	}
+	if cfg.ListenAddr() != old.ListenAddr() {
+		restart = append(restart, "listen")
+	}
+	if cfg.Relay != old.Relay {
+		restart = append(restart, "relay")
+	}
+	if !slices.EqualFunc(cfg.Plugins, old.Plugins, func(a, b config.Plugin) bool {
+		return a.ID == b.ID && slices.Equal(a.Command, b.Command)
+	}) {
+		restart = append(restart, "plugins")
+	}
+	d.log.Info("reloaded people and keys", "people", len(cfg.People), "keys", len(cfg.KeyEntries()))
+	if len(restart) > 0 {
+		d.log.Warn("homed.yaml changes that apply only after a restart", "sections", restart)
+	}
+	return restart, nil
 }
 
 // selfCheckLoop runs the relay self-check every 30 s while connected and logs only changes of the outcome.
-func selfCheckLoop(ctx context.Context, c *relay.Client, rc relay.Config, id string, log *slog.Logger) {
+func (d *daemon) selfCheckLoop(ctx context.Context) {
 	t := time.NewTicker(selfCheckInterval)
 	defer t.Stop()
 	last := "unknown"
@@ -141,39 +267,50 @@ func selfCheckLoop(ctx context.Context, c *relay.Client, rc relay.Config, id str
 			return
 		case <-t.C:
 		}
-		if !c.Status().Connected {
+		if !d.relay.Status().Connected {
 			continue
 		}
-		outcome := "ok"
-		if err := rc.SelfCheck(ctx, id); err != nil {
+		outcome := ""
+		if err := d.relayCfg.SelfCheck(ctx, d.instanceID); err != nil {
 			outcome = err.Error()
 		}
+		d.mu.Lock()
+		d.selfCheck = selfCheckResult{at: time.Now(), err: outcome}
+		d.mu.Unlock()
 		if outcome != last {
-			if outcome == "ok" {
-				log.Info("relay self-check passed", "url", "https://"+rc.Domain+"/healthz")
+			if outcome == "" {
+				d.log.Info("relay self-check passed", "url", "https://"+d.relayCfg.Domain+"/healthz")
 			} else {
-				log.Warn("relay self-check failed", "err", outcome)
+				d.log.Warn("relay self-check failed", "err", outcome)
 			}
 			last = outcome
 		}
 	}
 }
 
-// loopbackPort insists on a loopback listen address: the relay forwards to 127.0.0.1:<port>, and nothing else
-// should reach the hub directly.
-func loopbackPort(addr string) (int, error) {
-	host, p, err := net.SplitHostPort(addr)
+// listenSocket listens on the unix socket path (0600). A live socket means another homed runs on this data dir.
+func listenSocket(ctx context.Context, path string) (net.Listener, error) {
+	// sun_path holds 104 bytes on macOS (108 on Linux), the terminating NUL included.
+	if len(path) > 103 {
+		return nil, fmt.Errorf("socket path %s is too long for a unix socket; use a shorter --data-dir", path)
+	}
+	var dialer net.Dialer
+	if c, err := dialer.DialContext(ctx, "unix", path); err == nil {
+		_ = c.Close()
+		return nil, fmt.Errorf("homed is already running on this data dir (socket %s)", path)
+	}
+	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return nil, err
+	}
+	ln, err := (&net.ListenConfig{}).Listen(ctx, "unix", path)
 	if err != nil {
-		return 0, fmt.Errorf("listen %q: %w", addr, err)
+		return nil, err
 	}
-	if ip := net.ParseIP(host); host != "localhost" && (ip == nil || !ip.IsLoopback()) {
-		return 0, fmt.Errorf("listen %q: the hub serves on loopback only (e.g. %s)", addr, defaultListen)
+	if err := os.Chmod(path, 0o600); err != nil {
+		_ = ln.Close()
+		return nil, err
 	}
-	port, err := strconv.Atoi(p)
-	if err != nil || port <= 0 || port > 65535 {
-		return 0, fmt.Errorf("listen %q: bad port", addr)
-	}
-	return port, nil
+	return ln, nil
 }
 
 func newLogger(w io.Writer) *slog.Logger {
