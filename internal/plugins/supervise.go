@@ -136,6 +136,9 @@ func (h *Host) runOnce(ctx context.Context, p *plugin) (time.Duration, error) {
 			default:
 			}
 		},
+		ProgressNotificationHandler: func(_ context.Context, req *mcp.ProgressNotificationClientRequest) {
+			h.deliverProgress(p.id, req.Params)
+		},
 	})
 	connectCtx, cancel := context.WithTimeout(ctx, h.timing.rpcTimeout)
 	cs, err := client.Connect(connectCtx, &mcp.IOTransport{Reader: stdoutR, Writer: stdinW}, nil)

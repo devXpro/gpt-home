@@ -52,6 +52,9 @@ type Host struct {
 	cancel   context.CancelFunc
 	closed   bool
 	wg       sync.WaitGroup
+
+	progressSeq uint64                   // last progress token number
+	progress    map[string]*progressSink // by progress token, while the call runs
 }
 
 // timing holds the supervision delays; tests shorten them.
@@ -264,7 +267,7 @@ func (h *Host) Logs(id string) []string {
 	return nil
 }
 
-// Call runs a tool. See hub.ToolHost.
+// Call runs a tool. See hub.ToolHost. A context from WithProgress also receives the plugin's progress reports.
 func (h *Host) Call(ctx context.Context, caller hub.Caller, name string, args json.RawMessage) (hub.Result, error) {
 	tool, session, err := h.lookup(name)
 	if err != nil {
@@ -274,13 +277,19 @@ func (h *Host) Call(ctx context.Context, caller hub.Caller, name string, args js
 	if err != nil {
 		return hub.Result{}, err
 	}
-	ctx, cancel := context.WithTimeout(ctx, tool.Timeout)
-	defer cancel()
-	res, err := session.CallTool(ctx, &mcp.CallToolParams{
+	params := &mcp.CallToolParams{
 		Meta:      mcp.Meta{pluginkit.MetaCaller: caller.Person, pluginkit.MetaVia: caller.Via},
 		Name:      name,
 		Arguments: arguments,
-	})
+	}
+	if fn := progressFunc(ctx); fn != nil {
+		token, stop := h.watchProgress(tool.PluginID, fn)
+		defer stop()
+		params.SetProgressToken(token)
+	}
+	ctx, cancel := context.WithTimeout(ctx, tool.Timeout)
+	defer cancel()
+	res, err := session.CallTool(ctx, params)
 	switch {
 	case err == nil:
 	case ctx.Err() != nil:

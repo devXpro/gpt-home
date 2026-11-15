@@ -187,3 +187,5 @@ executable). About 2 s.
 ```sh
 go test -race ./internal/install/...
 ```
+
+- The plugin host tests also cover translated tool texts and progress (`TestToolI18n`, `TestCallProgress`, `TestParseI18n`, `TestDeliverProgress`; T2.7).

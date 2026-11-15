@@ -13,8 +13,9 @@
 //		log.Fatal(err)
 //	}
 //
-// The tool helpers ([Admin], [Timeout], [Inventory]) set the tool _meta keys the hub understands and return the same
-// tool, so they chain: pluginkit.Admin(pluginkit.Timeout(tool, 3*time.Minute)).
+// The tool helpers ([Admin], [Timeout], [Inventory], [I18n]) set the tool _meta keys the hub understands and return
+// the same tool, so they chain: pluginkit.Admin(pluginkit.Timeout(tool, 3*time.Minute)). [InventoryRef] marks an input
+// property that names a device, and [Progress] reports on a long-running call.
 package pluginkit
 
 import (
@@ -38,8 +39,16 @@ const (
 	MetaAudience = "gpt-home/audience" // "admin" hides a tool from assistants; the default is "assistant"
 	MetaTimeout  = "gpt-home/timeout"  // the hub-side call timeout in seconds
 	MetaRole     = "gpt-home/role"     // "inventory" marks the device-list tool
+	MetaI18n     = "gpt-home/i18n"     // translated texts: tool _meta (see I18n) and progress _meta (see Progress)
 	MetaCaller   = "gpt-home/caller"   // request _meta: the person's display name
 	MetaVia      = "gpt-home/via"      // request _meta: "site", "mcp", "admin" or "cli"
+)
+
+// SchemaRef is the input property schema keyword that links a property to something the hub knows; its only value is
+// RefInventory. See InventoryRef.
+const (
+	SchemaRef    = "x-gpt-home-ref"
+	RefInventory = "inventory"
 )
 
 // Environment variables the hub sets for a plugin.
@@ -102,6 +111,69 @@ func Timeout(t *mcp.Tool, d time.Duration) *mcp.Tool {
 // {"items":[{"id","name","subtitle"?,"state"?}]} with state one of on|off|offline|unknown|paired|unpaired.
 func Inventory(t *mcp.Tool) *mcp.Tool {
 	return setMeta(t, MetaRole, "inventory")
+}
+
+// Text is a tool's title, description and input labels in one language. The admin UI shows them; assistants always
+// get the tool's English title and description.
+type Text struct {
+	Title       string
+	Description string
+	Properties  map[string]string // input property name → label, e.g. "percent" → "Громкость, %"
+}
+
+// I18n adds the texts of t in lang (a language tag such as "ru") to its _meta "gpt-home/i18n". Calling it again for
+// another language adds that language; for the same language it replaces the texts. Empty fields are left out.
+func I18n(t *mcp.Tool, lang string, text Text) *mcp.Tool {
+	all, _ := t.Meta[MetaI18n].(map[string]any)
+	if all == nil {
+		all = map[string]any{}
+	}
+	entry := map[string]any{}
+	if text.Title != "" {
+		entry["title"] = text.Title
+	}
+	if text.Description != "" {
+		entry["description"] = text.Description
+	}
+	if len(text.Properties) > 0 {
+		props := make(map[string]any, len(text.Properties))
+		for k, v := range text.Properties {
+			props[k] = v
+		}
+		entry["properties"] = props
+	}
+	all[lang] = entry
+	return setMeta(t, MetaI18n, all)
+}
+
+// InventoryRef marks an input property schema as a device id from the plugin's inventory tool, so the admin shows a
+// device picker for it. It sets "x-gpt-home-ref": "inventory" on prop and returns it; a nil prop becomes a new map.
+// For a *jsonschema.Schema, set Extra[SchemaRef] = RefInventory instead.
+func InventoryRef(prop map[string]any) map[string]any {
+	if prop == nil {
+		prop = map[string]any{}
+	}
+	prop[SchemaRef] = RefInventory
+	return prop
+}
+
+// Progress reports how far a long-running call is, when the hub asked for reports (the request carries a progress
+// token); otherwise it does nothing and returns nil. progress must grow with every report; total is 0 when unknown.
+// message is short English for a person ("Press OK on the TV remote"), and i18n holds its translations by language
+// ({"ru": "Нажмите OK на пульте телевизора"}); both are optional.
+func Progress(ctx context.Context, req *mcp.CallToolRequest, progress, total float64, message string, i18n map[string]string) error {
+	if req == nil || req.Params == nil || req.Session == nil {
+		return nil
+	}
+	token := req.Params.GetProgressToken()
+	if token == nil {
+		return nil
+	}
+	p := &mcp.ProgressNotificationParams{ProgressToken: token, Progress: progress, Total: total, Message: message}
+	if len(i18n) > 0 {
+		p.Meta = mcp.Meta{MetaI18n: i18n}
+	}
+	return req.Session.NotifyProgress(ctx, p)
 }
 
 func setMeta(t *mcp.Tool, key string, value any) *mcp.Tool {

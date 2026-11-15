@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"slices"
 	"strings"
@@ -159,7 +160,7 @@ func TestListingAndAudiences(t *testing.T) {
 
 	admin := h.Tools(hub.AudienceAdmin)
 	wantAdmin := []string{"fake_add", "fake_crash", "fake_echo", "fake_env", "fake_fail", "fake_list", "fake_log",
-		"fake_sleep", "fake_weird", "fake_writer"}
+		"fake_progress", "fake_release", "fake_sleep", "fake_weird", "fake_writer"}
 	if got := names(admin); !slices.Equal(got, wantAdmin) {
 		t.Fatalf("admin tools = %v, want %v", got, wantAdmin)
 	}
@@ -613,4 +614,67 @@ func countPrefix(lines []string, prefix string) int {
 		}
 	}
 	return n
+}
+
+func TestToolI18n(t *testing.T) {
+	h, _ := newHost(t, fastTiming, fake())
+	waitUp(t, h, "fake")
+	tools := h.Tools(hub.AudienceAdmin)
+	want := map[string]hub.ToolText{"ru": {Title: "Эхо", Description: "Повторяет текст.", Properties: map[string]string{"text": "Текст"}}}
+	if got := toolByName(tools, "fake_echo").I18n; !reflect.DeepEqual(got, want) {
+		t.Errorf("fake_echo I18n = %#v, want %#v", got, want)
+	}
+	if got := toolByName(tools, "fake_log").I18n; got != nil {
+		t.Errorf("fake_log I18n = %#v, want nil", got)
+	}
+	// Assistants get the same tool; the English texts stay as they are.
+	if echo := toolByName(h.Tools(hub.AudienceAssistant), "fake_echo"); echo.Description != "Echoes text." || echo.I18n["ru"].Title != "Эхо" {
+		t.Errorf("assistant fake_echo = %+v", echo)
+	}
+}
+
+func TestCallProgress(t *testing.T) {
+	for _, args := range [][]string{nil, {"--legacy"}} {
+		t.Run(fmt.Sprint("args ", args), func(t *testing.T) {
+			h, _ := newHost(t, fastTiming, fake(args...))
+			waitUp(t, h, "fake")
+
+			reports := make(chan Progress, 10)
+			ctx := WithProgress(t.Context(), func(p Progress) { reports <- p })
+			type outcome struct {
+				res hub.Result
+				err error
+			}
+			done := make(chan outcome, 1)
+			go func() {
+				res, err := h.Call(ctx, roman, "fake_progress", nil)
+				done <- outcome{res, err}
+			}()
+			first, second := <-reports, <-reports
+			if _, err := h.Call(t.Context(), roman, "fake_release", nil); err != nil {
+				t.Fatal(err)
+			}
+			if o := <-done; o.err != nil || o.res.Text != "released" {
+				t.Fatalf("fake_progress = %+v, %v", o.res, o.err)
+			}
+			wantFirst := Progress{Progress: 1, Total: 2, Message: "Press OK", I18n: map[string]string{"ru": "Нажмите OK"}}
+			if !reflect.DeepEqual(first, wantFirst) {
+				t.Errorf("first report = %+v, want %+v", first, wantFirst)
+			}
+			if want := (Progress{Progress: 2, Total: 2, Message: "Almost done"}); !reflect.DeepEqual(second, want) {
+				t.Errorf("second report = %+v, want %+v", second, want)
+			}
+
+			// Without WithProgress the plugin gets no token and sends nothing.
+			if res, err := h.Call(t.Context(), roman, "fake_progress", nil); err != nil || res.Text != "no token" {
+				t.Fatalf("fake_progress without progress = %+v, %v", res, err)
+			}
+			h.mu.Lock()
+			left := len(h.progress)
+			h.mu.Unlock()
+			if left != 0 {
+				t.Errorf("%d progress sinks left after the calls", left)
+			}
+		})
+	}
 }

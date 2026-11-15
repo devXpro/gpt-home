@@ -58,10 +58,40 @@ func main() {
 		})
 	}
 
-	mcp.AddTool(s, &mcp.Tool{Name: "fake_echo", Description: "Echoes text."},
+	echo := pluginkit.I18n(&mcp.Tool{Name: "fake_echo", Description: "Echoes text."}, "ru", pluginkit.Text{
+		Title: "Эхо", Description: "Повторяет текст.", Properties: map[string]string{"text": "Текст"},
+	})
+	echo.Meta[pluginkit.MetaI18n].(map[string]any)["Not a tag"] = map[string]any{"title": "x"} // skipped by the hub
+	mcp.AddTool(s, echo,
 		func(_ context.Context, req *mcp.CallToolRequest, in textIn) (*mcp.CallToolResult, map[string]string, error) {
 			person, via := pluginkit.Caller(req)
 			return text(in.Text), map[string]string{"text": in.Text, "caller": person, "via": via}, nil
+		})
+	// fake_progress reports twice; when the hub asked for reports, it then waits for fake_release, so the test can
+	// see both reports arrive before the result.
+	release := make(chan struct{}, 1)
+	mcp.AddTool(s, &mcp.Tool{Name: "fake_progress", Description: "Reports progress twice."},
+		func(ctx context.Context, req *mcp.CallToolRequest, _ empty) (*mcp.CallToolResult, any, error) {
+			if err := pluginkit.Progress(ctx, req, 1, 2, "Press OK", map[string]string{"ru": "Нажмите OK", "bad tag": "x"}); err != nil {
+				return nil, nil, err
+			}
+			if err := pluginkit.Progress(ctx, req, 2, 2, "Almost done", nil); err != nil {
+				return nil, nil, err
+			}
+			if req.Params.GetProgressToken() == nil {
+				return text("no token"), nil, nil
+			}
+			select {
+			case <-release:
+				return text("released"), nil, nil
+			case <-ctx.Done():
+				return nil, nil, ctx.Err()
+			}
+		})
+	mcp.AddTool(s, &mcp.Tool{Name: "fake_release", Description: "Lets fake_progress finish."},
+		func(context.Context, *mcp.CallToolRequest, empty) (*mcp.CallToolResult, any, error) {
+			release <- struct{}{}
+			return text("ok"), nil, nil
 		})
 	mcp.AddTool(s, pluginkit.Timeout(&mcp.Tool{Name: "fake_sleep", Description: "Sleeps ms milliseconds."}, time.Second),
 		func(ctx context.Context, _ *mcp.CallToolRequest, in sleepIn) (*mcp.CallToolResult, any, error) {

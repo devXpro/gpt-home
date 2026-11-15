@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -120,5 +121,83 @@ func TestConvertTool(t *testing.T) {
 				t.Errorf("schema %s plugin %q", got.InputSchema, got.PluginID)
 			}
 		})
+	}
+}
+
+func TestParseI18n(t *testing.T) {
+	tests := []struct {
+		name     string
+		in       any
+		want     map[string]hub.ToolText
+		warnings int
+	}{
+		{name: "full", in: map[string]any{
+			"ru":    map[string]any{"title": "Громкость", "description": "Задаёт громкость.", "properties": map[string]any{"percent": "Громкость, %"}},
+			"pt-BR": map[string]any{"title": "Volume"},
+		}, want: map[string]hub.ToolText{
+			"ru":    {Title: "Громкость", Description: "Задаёт громкость.", Properties: map[string]string{"percent": "Громкость, %"}},
+			"pt-BR": {Title: "Volume"},
+		}},
+		{name: "not an object", in: "ru", warnings: 1},
+		{name: "bad tags and entries", in: map[string]any{
+			"Russian": map[string]any{"title": "x"},
+			"":        map[string]any{"title": "x"},
+			"ru":      "Громкость",
+			"uk":      map[string]any{"title": "Гучність"},
+		}, want: map[string]hub.ToolText{"uk": {Title: "Гучність"}}, warnings: 3},
+		{name: "bad fields kept partly", in: map[string]any{
+			"ru": map[string]any{"title": 5, "description": "Описание", "properties": map[string]any{"tv": "Телевизор", "n": 1}, "extra": "x"},
+		}, want: map[string]hub.ToolText{"ru": {Description: "Описание", Properties: map[string]string{"tv": "Телевизор"}}}, warnings: 3},
+		{name: "bad properties", in: map[string]any{"ru": map[string]any{"title": "Т", "properties": []any{"tv"}}},
+			want: map[string]hub.ToolText{"ru": {Title: "Т"}}, warnings: 1},
+		{name: "empty entry dropped", in: map[string]any{"ru": map[string]any{}}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, warnings := parseI18n(tt.in)
+			if !reflect.DeepEqual(got, tt.want) || len(warnings) != tt.warnings {
+				t.Errorf("parseI18n = %#v, warnings %q\nwant %#v with %d warnings", got, warnings, tt.want, tt.warnings)
+			}
+		})
+	}
+	tool, warnings, err := convertTool("tv", pluginkit.I18n(&mcp.Tool{Name: "tv_on"}, "ru", pluginkit.Text{Title: "Включить"}))
+	if err != nil || len(warnings) != 0 || tool.I18n["ru"].Title != "Включить" {
+		t.Errorf("convertTool with i18n = %+v, %q, %v", tool.I18n, warnings, err)
+	}
+}
+
+func TestDeliverProgress(t *testing.T) {
+	h, err := New(nil, t.TempDir(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got []Progress
+	token, stop := h.watchProgress("tv", func(p Progress) { got = append(got, p) })
+	other, stopOther := h.watchProgress("tv", func(Progress) { t.Error("another call's callback ran") })
+	defer stopOther()
+	if token == other {
+		t.Fatalf("two calls share the token %q", token)
+	}
+
+	h.deliverProgress("tv", &mcp.ProgressNotificationParams{ProgressToken: token, Progress: 1, Message: "Searching",
+		Meta: mcp.Meta{pluginkit.MetaI18n: map[string]any{"ru": "Ищу", "uk": 5, "bad tag": "x", "de": ""}}})
+	h.deliverProgress("kettle", &mcp.ProgressNotificationParams{ProgressToken: token, Progress: 9}) // another plugin
+	h.deliverProgress("tv", &mcp.ProgressNotificationParams{ProgressToken: "nope", Progress: 9})
+	h.deliverProgress("tv", &mcp.ProgressNotificationParams{ProgressToken: 1.0, Progress: 9}) // not our token type
+	h.deliverProgress("tv", nil)
+	h.deliverProgress("tv", &mcp.ProgressNotificationParams{ProgressToken: token, Progress: 2, Total: 4,
+		Meta: mcp.Meta{pluginkit.MetaI18n: "not an object"}})
+	stop()
+	h.deliverProgress("tv", &mcp.ProgressNotificationParams{ProgressToken: token, Progress: 3}) // after the call ended
+
+	want := []Progress{
+		{Progress: 1, Message: "Searching", I18n: map[string]string{"ru": "Ищу"}},
+		{Progress: 2, Total: 4},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("reports = %+v\nwant %+v", got, want)
+	}
+	if fn := progressFunc(t.Context()); fn != nil {
+		t.Error("a plain context carries a progress callback")
 	}
 }

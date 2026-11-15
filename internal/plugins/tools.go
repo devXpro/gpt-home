@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"regexp"
 	"slices"
 	"strings"
 	"time"
@@ -122,5 +123,75 @@ func convertTool(pluginID string, t *mcp.Tool) (hub.Tool, []string, error) {
 			out.Inventory = true
 		}
 	}
+	if v, ok := t.Meta[pluginkit.MetaI18n]; ok {
+		var w []string
+		out.I18n, w = parseI18n(v)
+		warnings = append(warnings, w...)
+	}
 	return out, warnings, nil
+}
+
+var langRe = regexp.MustCompile(`^[a-z]{2,3}(-[A-Za-z0-9]{2,8})*$`)
+
+// parseI18n reads _meta "gpt-home/i18n": {"<lang>": {"title", "description", "properties": {"<prop>": "<label>"}}}.
+// It is lenient: malformed languages and fields are skipped with a warning, the rest is kept. It returns nil when
+// nothing usable is left.
+func parseI18n(v any) (map[string]hub.ToolText, []string) {
+	langs, ok := v.(map[string]any)
+	if !ok {
+		return nil, []string{fmt.Sprintf("i18n is not an object (%T), ignored", v)}
+	}
+	var out map[string]hub.ToolText
+	var warnings []string
+	for lang, raw := range langs {
+		entry, ok := raw.(map[string]any)
+		if !langRe.MatchString(lang) || !ok {
+			warnings = append(warnings, fmt.Sprintf("i18n %q is not a language tag with an object, ignored", lang))
+			continue
+		}
+		var text hub.ToolText
+		for key, val := range entry {
+			switch key {
+			case "title", "description":
+				s, ok := val.(string)
+				if !ok {
+					warnings = append(warnings, fmt.Sprintf("i18n %s.%s is not a string, ignored", lang, key))
+					continue
+				}
+				if key == "title" {
+					text.Title = s
+				} else {
+					text.Description = s
+				}
+			case "properties":
+				props, ok := val.(map[string]any)
+				if !ok {
+					warnings = append(warnings, fmt.Sprintf("i18n %s.properties is not an object, ignored", lang))
+					continue
+				}
+				for name, label := range props {
+					s, ok := label.(string)
+					if !ok {
+						warnings = append(warnings, fmt.Sprintf("i18n %s.properties.%s is not a string, ignored", lang, name))
+						continue
+					}
+					if text.Properties == nil {
+						text.Properties = map[string]string{}
+					}
+					text.Properties[name] = s
+				}
+			default:
+				warnings = append(warnings, fmt.Sprintf("i18n %s.%s is unknown, ignored", lang, key))
+			}
+		}
+		if text.Title == "" && text.Description == "" && len(text.Properties) == 0 {
+			continue
+		}
+		if out == nil {
+			out = map[string]hub.ToolText{}
+		}
+		out[lang] = text
+	}
+	slices.Sort(warnings) // map order is random; keep the log stable
+	return out, warnings
 }
