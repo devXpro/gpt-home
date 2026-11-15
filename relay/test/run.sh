@@ -223,7 +223,8 @@ main() {
 	new_token="$(tr -d '[:space:]' <"$WORK/relay/token")"
 	[[ "$new_token" =~ ^[0-9a-f]{64}$ && "$new_token" != "$token" ]] || fail "--rotate-token did not produce a new token"
 	token="$new_token"
-	[[ "$(stat -f %Lp "$WORK/relay/token" 2>/dev/null || stat -c %a "$WORK/relay/token")" == "600" ]] || fail "token is not 0600"
+	# GNU stat first: on Linux `stat -f` is the file system status and prints something else.
+	[[ "$(stat -c %a "$WORK/relay/token" 2>/dev/null || stat -f %Lp "$WORK/relay/token")" == "600" ]] || fail "token is not 0600"
 	pass "--rotate-token writes a new 0600 token"
 	bash "$ROOT/install/server.sh" --mode behind-proxy --network gpthome-test-proxy --dir "$WORK/behind" \
 		--domain "$DOMAIN" --skip-dns-check --yes --no-root-check --no-start >/dev/null 2>&1 || fail "behind-proxy run failed"
