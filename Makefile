@@ -13,4 +13,4 @@ web:
 	@if [ -d web ]; then npm --prefix web ci && npm --prefix web run build; else echo "web/ not present yet, skipping"; fi
 
 site-test:
-	@if [ -d site ]; then node --test site/core; else echo "site/ not present yet, skipping"; fi
+	@if [ -d site ]; then node --test "site/core/*.test.mjs"; else echo "site/ not present yet, skipping"; fi
