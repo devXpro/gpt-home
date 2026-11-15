@@ -15,5 +15,17 @@ auth.tokenSource.file.path = "/etc/frp/token"
 # Served with status 404 while no frpc is connected (home is offline).
 custom404Page = "/etc/frp/offline.html"
 
+# How long frps waits for the home's response headers. frp's default is 60 s,
+# but hub tool calls may run up to 300 s (pairing): 330 leaves a margin.
+vhostHTTPTimeout = 330
+
+# Our frpc only registers an "http" proxy, which is routed by the Host header on
+# vhostHTTPPort and needs no port of its own. tcp/udp proxies must get a port
+# from this list; an empty list would mean "any port". 7000 is frps's own port,
+# so a tcp proxy can never bind it: a token holder cannot open listeners on the
+# relay. (A udp proxy could still bind udp/7000 inside the container; no port is
+# published, so it is unreachable from outside.)
+allowPorts = [{ single = 7000 }]
+
 log.to = "console"
 log.level = "info"

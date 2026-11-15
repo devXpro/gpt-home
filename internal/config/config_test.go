@@ -221,6 +221,77 @@ func TestResolveDataDir(t *testing.T) {
 	}
 }
 
+// An existing dir is never chmodded (a mistaken --data-dir must not lock up a home dir); the platform default dir is
+// homed's own and is tightened.
+func TestResolveDataDirLeavesExistingModes(t *testing.T) {
+	loose := filepath.Join(t.TempDir(), "shared")
+	if err := os.Mkdir(loose, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(loose, 0o755); err != nil { //nolint:gosec // deliberately loose
+		t.Fatal(err)
+	}
+	if _, err := ResolveDataDir(loose); err != nil {
+		t.Fatal(err)
+	}
+	if st, _ := os.Stat(loose); st.Mode().Perm() != 0o755 {
+		t.Fatalf("an existing dir was changed to %v", st.Mode().Perm())
+	}
+	if w := DataDirWarning(loose); !strings.Contains(w, "chmod 700 "+loose) {
+		t.Fatalf("warning = %q", w)
+	}
+
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("XDG_DATA_HOME", filepath.Join(home, "xdg"))
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, "xdgconfig"))
+	def, err := DefaultDataDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(def, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(def, 0o755); err != nil { //nolint:gosec // deliberately loose
+		t.Fatal(err)
+	}
+	if got, err := ResolveDataDir(""); err != nil || got != def {
+		t.Fatalf("default dir = %q, %v", got, err)
+	}
+	if st, _ := os.Stat(def); st.Mode().Perm() != 0o700 {
+		t.Fatalf("default dir mode %v, want 0700", st.Mode().Perm())
+	}
+	if w := DataDirWarning(def); w != "" {
+		t.Fatalf("warning on a 0700 dir: %q", w)
+	}
+
+	file := filepath.Join(t.TempDir(), "file")
+	if err := os.WriteFile(file, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ResolveDataDir(file); err == nil {
+		t.Fatal("a regular file was accepted as the data dir")
+	}
+}
+
+func TestLockInstance(t *testing.T) {
+	dir := t.TempDir()
+	unlock, err := LockInstance(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// flock locks belong to the open file, so a second open in the same process conflicts like another homed would.
+	if _, err := LockInstance(dir); !errors.Is(err, ErrAlreadyRunning) {
+		t.Fatalf("second lock: %v", err)
+	}
+	unlock()
+	again, err := LockInstance(dir)
+	if err != nil {
+		t.Fatalf("lock after release: %v", err)
+	}
+	again()
+}
+
 func TestLoopbackPort(t *testing.T) {
 	tests := []struct {
 		addr    string
@@ -228,8 +299,11 @@ func TestLoopbackPort(t *testing.T) {
 		wantErr bool
 	}{
 		{"127.0.0.1:8080", 8080, false},
-		{"[::1]:9000", 9000, false},
 		{"localhost:8081", 8081, false},
+		// The relay forwards to 127.0.0.1 only, so other loopback addresses would be unreachable through it.
+		{"[::1]:9000", 0, true},
+		{"127.0.0.2:8080", 0, true},
+		{"127.1:8080", 0, true},
 		{"0.0.0.0:8080", 0, true},
 		{"192.168.68.63:8080", 0, true},
 		{"127.0.0.1", 0, true},

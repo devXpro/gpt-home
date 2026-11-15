@@ -261,8 +261,12 @@ func TestDaemon(t *testing.T) {
 	// A second homed on the same data dir is refused.
 	err = serve(context.Background(), runOptions{dataDir: dir, listen: "127.0.0.1:" + strconv.Itoa(freePort(t))},
 		slog.New(slog.DiscardHandler))
-	if err == nil || !strings.Contains(err.Error(), "already running") {
+	if !errors.Is(err, config.ErrAlreadyRunning) {
 		t.Fatalf("second homed: %v", err)
+	}
+	// ... and leaves the first one's socket alone.
+	if out := mustCLI(t, "plugin", "list", "--data-dir", dir); !strings.Contains(out, "up") {
+		t.Fatalf("the first homed's socket after the refused second start:\n%s", out)
 	}
 
 	// Revoking on the running homed takes effect at once.
@@ -318,6 +322,31 @@ func checkAudit(t *testing.T, dir string) {
 	for _, want := range []string{"cli fake_echo", "cli fake_add", "cli fake_fail", "cli fake_nope"} {
 		if !seen[want] {
 			t.Errorf("audit lacks %q; has %v", want, seen)
+		}
+	}
+}
+
+// A relay that fails before it ever connects (here: the CA file is missing) shows why in `homed relay status`.
+func TestRelayConfigErrorInStatus(t *testing.T) {
+	dir := shortTempDir(t)
+	mustCLI(t, "plugin", "add", "--id", "fake", "--data-dir", dir, "--", fakeBin, "serve")
+	mustCLI(t, "relay", "connect", testCode(t, "homie.test"), "--data-dir", dir)
+	d, _ := startDaemon(t, runOptions{
+		dataDir: dir, listen: "127.0.0.1:" + strconv.Itoa(freePort(t)), caFile: filepath.Join(dir, "missing-ca.pem"),
+	})
+	tick := time.NewTicker(50 * time.Millisecond)
+	defer tick.Stop()
+	deadline := time.After(10 * time.Second)
+	for {
+		out := mustCLI(t, "relay", "status", "--data-dir", dir)
+		if strings.Contains(out, "last error: read relay CA file") && strings.Contains(out, "disconnected") &&
+			d.relay.Status().LastError != "" {
+			return
+		}
+		select {
+		case <-tick.C:
+		case <-deadline:
+			t.Fatalf("relay status never showed the config error:\n%s", out)
 		}
 	}
 }

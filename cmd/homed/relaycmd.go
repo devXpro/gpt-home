@@ -43,6 +43,9 @@ func cmdRelayConnect(args []string, stdin io.Reader, stdout, stderr io.Writer) e
 	if err != nil {
 		return err
 	}
+	if w := config.DataDirWarning(dir); w != "" {
+		fmt.Fprintln(stderr, "warning:", w)
+	}
 	if err := config.WriteRelayToken(dir, code.Token); err != nil {
 		return fmt.Errorf("save relay token: %w", err)
 	}
@@ -79,7 +82,7 @@ func cmdRelayStatus(args []string, stdout, stderr io.Writer) error {
 		return err
 	}
 	if st.Domain == "" {
-		fmt.Fprintln(stdout, "relay:      not configured (run: homed relay connect <code>)")
+		fmt.Fprintln(stdout, "relay:      not configured (run: homed relay connect - and paste the code)")
 		return nil
 	}
 	state := "disconnected"

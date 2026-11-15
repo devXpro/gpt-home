@@ -38,7 +38,9 @@ const (
 	InstanceIDFile = "instance-id"
 	SocketFile     = "homed.sock"
 	AuditDir       = "audit"
-	lockFile       = ".homed.yaml.lock"
+	// InstanceLockFile is flocked by the running homed for its whole life (LockInstance).
+	InstanceLockFile = ".homed.lock"
+	lockFile         = ".homed.yaml.lock"
 )
 
 // DefaultListen is the hub's address when homed.yaml sets none.
@@ -181,15 +183,16 @@ func (c *Config) Validate() error {
 	return nil
 }
 
-// LoopbackPort checks that addr is a loopback host:port and returns the port. The relay forwards to
-// 127.0.0.1:<port>, and nothing else should reach the hub directly.
+// LoopbackPort checks that addr is 127.0.0.1:<port> or localhost:<port> and returns the port. The relay forwards to
+// 127.0.0.1:<port> and the Host guard knows only that address, so other loopback addresses (127.0.0.2, [::1]) would
+// leave the hub unreachable through the relay; nothing else should reach the hub directly.
 func LoopbackPort(addr string) (int, error) {
 	host, p, err := net.SplitHostPort(addr)
 	if err != nil {
 		return 0, fmt.Errorf("listen %q: %w", addr, err)
 	}
-	if ip := net.ParseIP(host); host != "localhost" && (ip == nil || !ip.IsLoopback()) {
-		return 0, fmt.Errorf("listen %q: the hub serves on loopback only (e.g. %s)", addr, DefaultListen)
+	if host != "127.0.0.1" && host != "localhost" {
+		return 0, fmt.Errorf("listen %q: the hub serves on loopback only: 127.0.0.1 or localhost (e.g. %s)", addr, DefaultListen)
 	}
 	port, err := strconv.Atoi(p)
 	if err != nil || port <= 0 || port > 65535 {
@@ -198,7 +201,10 @@ func LoopbackPort(addr string) (int, error) {
 	return port, nil
 }
 
-// ResolveDataDir applies the flag value, then HOMED_DATA_DIR, then the platform default, and makes the dir (0700).
+// ResolveDataDir applies the flag value, then HOMED_DATA_DIR, then the platform default. A dir it has to create is
+// made 0700. An existing dir keeps its mode, so a mistaken --data-dir (a home dir, /var/lib) is never chmodded; the
+// one exception is the platform default dir, which is homed's own and is tightened back to 0700. DataDirWarning
+// reports an existing dir that is open to others.
 func ResolveDataDir(flagValue string) (string, error) {
 	dir := flagValue
 	if dir == "" {
@@ -214,13 +220,40 @@ func ResolveDataDir(flagValue string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return "", fmt.Errorf("create data dir: %w", err)
+	st, err := os.Stat(dir)
+	switch {
+	case errors.Is(err, fs.ErrNotExist):
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			return "", fmt.Errorf("create data dir: %w", err)
+		}
+		return dir, secureDir(dir) // a umask can only narrow 0700, but say it once
+	case err != nil:
+		return "", fmt.Errorf("data dir: %w", err)
+	case !st.IsDir():
+		return "", fmt.Errorf("data dir %s is not a directory", dir)
 	}
-	if err := os.Chmod(dir, 0o700); err != nil { //nolint:gosec // a directory needs the x bit; 0700 is owner-only
-		return "", fmt.Errorf("secure data dir: %w", err)
+	if def, err := DefaultDataDir(); err == nil && def == dir && st.Mode().Perm()&0o077 != 0 {
+		return dir, secureDir(dir)
 	}
 	return dir, nil
+}
+
+func secureDir(dir string) error {
+	if err := os.Chmod(dir, 0o700); err != nil { //nolint:gosec // a directory needs the x bit; 0700 is owner-only
+		return fmt.Errorf("secure data dir: %w", err)
+	}
+	return nil
+}
+
+// DataDirWarning returns a warning when the data dir is readable or writable by group or others, "" otherwise. Its
+// secret files are 0600 either way, but others could list them or, with write access, swap them.
+func DataDirWarning(dir string) string {
+	st, err := os.Stat(dir)
+	if err != nil || st.Mode().Perm()&0o077 == 0 {
+		return ""
+	}
+	return fmt.Sprintf("data dir %s is open to other users (mode %o); homed does not change the mode of a dir it did "+
+		"not create. Run: chmod 700 %s", dir, st.Mode().Perm(), dir)
 }
 
 // DefaultDataDir is ~/Library/Application Support/gpt-home on macOS and $XDG_DATA_HOME/gpt-home (or
@@ -382,6 +415,31 @@ func lock(dir string) (func(), error) {
 	if err := syscall.Flock(fd, syscall.LOCK_EX); err != nil {
 		_ = f.Close()
 		return nil, fmt.Errorf("lock %s: %w", FileName, err)
+	}
+	return func() {
+		_ = syscall.Flock(fd, syscall.LOCK_UN)
+		_ = f.Close()
+	}, nil
+}
+
+// ErrAlreadyRunning means another homed holds the instance lock of the data dir.
+var ErrAlreadyRunning = errors.New("homed is already running on this data dir")
+
+// LockInstance takes the data dir's instance lock (<dir>/.homed.lock, flock, non-blocking) and returns its release
+// func. The daemon holds it for its whole life: the kernel drops it when the process ends, crash included, so there
+// is no stale-lock cleanup and no window in which two daemons both see "nobody runs here".
+func LockInstance(dir string) (func(), error) {
+	f, err := os.OpenFile(filepath.Join(dir, InstanceLockFile), os.O_CREATE|os.O_RDWR, 0o600) //nolint:gosec // the hub's own data dir
+	if err != nil {
+		return nil, err
+	}
+	fd := int(f.Fd())
+	if err := syscall.Flock(fd, syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		_ = f.Close()
+		if errors.Is(err, syscall.EWOULDBLOCK) {
+			return nil, fmt.Errorf("%w (%s)", ErrAlreadyRunning, dir)
+		}
+		return nil, fmt.Errorf("lock %s: %w", InstanceLockFile, err)
 	}
 	return func() {
 		_ = syscall.Flock(fd, syscall.LOCK_UN)

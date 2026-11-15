@@ -520,7 +520,9 @@ print_result() {
 	info ""
 	printf '%s\n' "$code"
 	info ""
-	info "Next step, on the home computer:  homed relay connect <code>"
+	info "Next step, on the home computer:  homed relay connect -"
+	info "                                   then paste the code and press Enter (this keeps it out of"
+	info "                                   shell history and the process list)."
 	info "To show the code again:           bash server.sh --print-code --dir $DIR"
 }
 

@@ -144,8 +144,18 @@ func TestParseFrpLine(t *testing.T) {
 
 func TestRunRejectsBadConfig(t *testing.T) {
 	var c Client
-	if err := c.Run(context.Background(), Config{Domain: "homie.test"}, nil); err == nil {
+	err := c.Run(context.Background(), Config{Domain: "homie.test"}, nil)
+	if err == nil {
 		t.Fatal("Run accepted a config without token and port")
+	}
+	// `homed relay status` reads the status, so the reason the relay never connected must be there.
+	if st := c.Status(); st.LastError != err.Error() || st.Connected {
+		t.Fatalf("status after a config error = %+v, want LastError %q", st, err)
+	}
+	missingCA := Config{Domain: "homie.test", Token: testToken, LocalPort: 8080, CAFile: filepath.Join(t.TempDir(), "nope.pem")}
+	if err := c.Run(context.Background(), missingCA, nil); err == nil || c.Status().LastError != err.Error() ||
+		strings.Contains(c.Status().LastError, testToken) {
+		t.Fatalf("missing CA file: err %v, status %+v", err, c.Status())
 	}
 }
 

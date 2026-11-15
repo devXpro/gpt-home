@@ -234,8 +234,19 @@ func (c *Client) setError(msg string) {
 }
 
 // Run connects to the relay and keeps the connection up, reconnecting with backoff, until ctx is done. It returns nil
-// after ctx is done and an error only when the configuration is invalid or frp cannot start.
+// after ctx is done and an error only when the configuration is invalid or frp cannot start. That error is also kept
+// in Status().LastError, so `homed relay status` shows why the relay never connected.
 func (c *Client) Run(ctx context.Context, cfg Config, log *slog.Logger) error {
+	err := c.run(ctx, cfg, log)
+	if err != nil && !errors.Is(err, errAlreadyRunning) { // the running client's status is not this call's to change
+		c.setError(err.Error())
+	}
+	return err
+}
+
+var errAlreadyRunning = errors.New("relay client is already running")
+
+func (c *Client) run(ctx context.Context, cfg Config, log *slog.Logger) error {
 	if log == nil {
 		log = slog.New(slog.DiscardHandler)
 	}
@@ -251,7 +262,7 @@ func (c *Client) Run(ctx context.Context, cfg Config, log *slog.Logger) error {
 	c.mu.Lock()
 	if c.running {
 		c.mu.Unlock()
-		return errors.New("relay client is already running")
+		return errAlreadyRunning
 	}
 	c.running = true
 	c.mu.Unlock()

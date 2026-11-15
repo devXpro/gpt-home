@@ -19,7 +19,14 @@ ChatGPT / a Site ──https──▶ Caddy :443 ──▶ gpt-home-frps :7000 �
   connected client's `http` proxy (`customDomains = [<domain>]`). Verified in frp v0.72.0 `server/service.go` (mux with a
   websocket prefix listener and an HTTP listener on the same port).
 - **Token.** `auth.method = "token"`, the token is read from a file (`auth.tokenSource.file.path`, whitespace trimmed).
-  Nobody without it can register a proxy.
+  Nobody without it can register a proxy. Anyone *with* it can register the domain while the home box is offline and
+  answer the public traffic in its place, so treat it like the person keys (see `docs/SECURITY.md`) and rotate it when
+  it may have leaked.
+- **Only the http proxy.** `allowPorts = [{ single = 7000 }]` gives `tcp`/`udp` proxies only frps's own port, which
+  is taken, so even a token holder cannot open listeners on the relay (an empty `allowPorts` would mean "any port").
+  The `http` proxy homed registers is routed by `Host` on `vhostHTTPPort` and needs no port. The smoke test checks it.
+- **Slow tools.** `vhostHTTPTimeout = 330`: frps waits up to 330 s for the home's response headers (frp's default is
+  60 s; hub tool calls may take up to 300 s, e.g. pairing).
 - **Home offline.** With no client connected, frps answers vhost requests with `custom404Page`: `relay/offline.html`,
   status 404, `text/html`, bilingual (EN/RU), dark, self-contained. The ChatGPT Site recognizes a non-JSON 404 as "home is
   offline" (PLAN §5.7).
@@ -106,7 +113,8 @@ is a secret. The installer prints it once; show it again with:
 sudo bash install/server.sh --print-code --dir /opt/gpt-home-relay
 ```
 
-On the home box: `homed relay connect <code>`.
+On the home box run `homed relay connect -` and paste the code (it is read from stdin, so it stays out of the shell
+history and the process list). `homed relay connect <code>` also works, but leaves the token in both.
 
 ## Home client settings (for the relay client in `homed`)
 
@@ -140,7 +148,10 @@ to true and is irrelevant for wss.
 
 - **Rotate the token** (all home boxes must connect again with the new code):
   `sudo bash install/server.sh --rotate-token --dir /opt/gpt-home-relay`. The script restarts frps and prints the new
-  code. Rerunning the installer without the flag keeps the token and every file as it is.
+  code; on the home box run `homed relay connect -`, paste it and restart homed. Rerunning the installer without the
+  flag keeps the token and every file as it is. Rotate whenever the code or the token may have been seen by someone
+  else: a pasted chat, a screenshot, a shared terminal, a backup of the home data dir, a person who no longer should
+  have it.
 - **Update** the stack: rerun the installer (the images are pinned in the compose files; bump them in the repo).
 - **Uninstall:** `sudo bash install/server.sh --uninstall --dir /opt/gpt-home-relay`. It stops and removes the containers
   and deletes the installed files. The Caddy volumes (certificates) are kept, because Let's Encrypt limits reissuance;
@@ -161,4 +172,5 @@ to true and is irrelevant for wss.
 | frpc logs `x509: ...` | The certificate is not valid for the domain yet (Let's Encrypt not issued), or a proxy in between re-signs TLS. |
 | The channel drops on every proxy reload | The route lacks `stream_close_delay` (Caddy), or the proxy closes idle WebSockets: raise its timeouts. |
 | The channel drops after about a minute of silence | A proxy or CDN in front has a short idle timeout (nginx `proxy_read_timeout`, Cloudflare orange cloud). |
+| A long tool call (pairing) ends with a 504 from the proxy | The proxy in front gives up before the 300 s tool timeout: raise its response timeout (nginx `proxy_read_timeout`) above 330 s. |
 | The wrong site answers on 443 | Another vhost on the same Caddy/nginx catches the domain first; check the site block order. |

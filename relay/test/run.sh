@@ -9,7 +9,8 @@
 #   - frpc's wss channel (/~!frp) works on the same hostname;
 #   - a Caddy reload does not drop the channel;
 #   - with frpc stopped the offline page is served with status 404;
-#   - the channel is TLS-verified and token-protected.
+#   - the channel is TLS-verified and token-protected;
+#   - even a valid token cannot open tcp proxies (allowPorts), and vhostHTTPTimeout is 330 s.
 #
 # Everything is named gpthome-test-* and removed on exit. Needs: docker (compose
 # v2), go, curl, openssl. Nothing leaves this machine except image pulls.
@@ -394,6 +395,29 @@ EOF
 		bash -c "docker logs $C_BAD 2>&1 | grep -qi \"token in login doesn't match\""
 	pass "a frpc with a wrong token cannot log in"
 	docker rm -f "$C_BAD" >/dev/null
+
+	log "a token holder cannot open tcp listeners on the relay (allowPorts)"
+	{
+		frpc_toml /etc/frp/token /ca/root.crt | sed '/^\[\[proxies\]\]/,$d'
+		printf '\n[[proxies]]\nname = "rogue"\ntype = "tcp"\nlocalIP = "%s"\nlocalPort = 8080\nremotePort = 6000\n' "$C_ECHO"
+		printf '\n[[proxies]]\nname = "rogue-any"\ntype = "tcp"\nlocalIP = "%s"\nlocalPort = 8080\nremotePort = 0\n' "$C_ECHO"
+	} >"$WORK/frpc/tcp.toml"
+	docker run -d --name "$C_BAD" --network "$NET" \
+		-v "$WORK/frpc/tcp.toml:/etc/frp/frpc.toml:ro" \
+		-v "$WORK/relay/token:/etc/frp/token:ro" \
+		-v "$WORK/root.crt:/ca/root.crt:ro" \
+		"$FRPC_IMAGE" -c /etc/frp/frpc.toml >/dev/null
+	wait_for "frps to refuse the fixed tcp port" 30 \
+		bash -c "docker logs $C_BAD 2>&1 | grep -q '\\[rogue\\] start error: port not allowed'"
+	wait_for "frps to refuse a random tcp port" 30 \
+		bash -c "docker logs $C_BAD 2>&1 | grep -q '\\[rogue-any\\] start error'"
+	if docker logs "$C_BAD" 2>&1 | grep -q '\[rogue[a-z-]*\] start proxy success'; then
+		fail "frps accepted a tcp proxy"
+	fi
+	pass "tcp proxies are refused, with a fixed port and with a random one"
+	docker rm -f "$C_BAD" >/dev/null
+	grep -q '^vhostHTTPTimeout = 330$' "$WORK/relay/frps.toml" || fail "frps.toml lacks vhostHTTPTimeout = 330"
+	pass "frps waits 330 s for response headers (above the 300 s tool timeout)"
 
 	log "an untrusted server certificate is rejected by frpc"
 	openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -days 1 \

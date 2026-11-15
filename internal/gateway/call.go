@@ -7,8 +7,10 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"strings"
 	"time"
 
+	"github.com/modelcontextprotocol/go-sdk/jsonrpc"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
 	"github.com/devXpro/gpt-home/internal/audit"
@@ -116,15 +118,35 @@ func (g *gateway) record(ctx context.Context, caller hub.Caller, name string, ar
 		Tool:     name,
 		Args:     audit.Redact(args),
 		OK:       err == nil && !res.IsError,
+		Error:    AuditError(res, err),
 		Duration: g.now().Sub(start),
 	}
-	switch {
-	case err != nil:
-		e.Error = err.Error()
-	case res.IsError:
+	if e.Error == "" && res.IsError {
 		e.Error = failureText(res)
 	}
 	g.audit.Record(ctx, e)
+}
+
+// errInvalidArgs is what the audit log keeps of a schema-validation failure.
+const errInvalidArgs = "invalid arguments (rejected by the tool's input schema; details not logged)"
+
+// AuditError is the error text for an audit entry: "" when the call worked. Schema-validation failures quote the
+// rejected argument values, and those may be secrets (a PIN, a pairing code) that Redact hid in the arguments, so
+// they become a fixed message. Both go-sdk shapes are caught: the isError result of a typed handler
+// (`validating "arguments": …`) and a JSON-RPC invalid-params error.
+func AuditError(res hub.Result, err error) string {
+	var rpcErr *jsonrpc.Error
+	switch {
+	case err != nil && errors.As(err, &rpcErr) && rpcErr.Code == jsonrpc.CodeInvalidParams:
+		return errInvalidArgs
+	case err != nil:
+		return err.Error()
+	case res.IsError && strings.HasPrefix(strings.TrimSpace(res.Text), `validating "arguments"`):
+		return errInvalidArgs
+	case res.IsError:
+		return res.Text
+	}
+	return ""
 }
 
 // mcpToolHandler runs one tool for /mcp. Every failure becomes an isError result with text the model can relay.

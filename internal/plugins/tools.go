@@ -61,6 +61,9 @@ func convertTool(pluginID string, t *mcp.Tool) (hub.Tool, []string, error) {
 	if err := pluginkit.CheckToolName(pluginID, t.Name); err != nil {
 		return hub.Tool{}, nil, err
 	}
+	if err := checkAddTool(t); err != nil {
+		return hub.Tool{}, nil, err
+	}
 	out := hub.Tool{
 		PluginID:    pluginID,
 		Name:        t.Name,
@@ -129,6 +132,24 @@ func convertTool(pluginID string, t *mcp.Tool) (hub.Tool, []string, error) {
 		warnings = append(warnings, w...)
 	}
 	return out, warnings, nil
+}
+
+// checkAddTool registers a copy of t on a throwaway MCP server and turns the go-sdk's AddTool panic into an error. The
+// gateway serves every tool through such a server, so a schema the SDK refuses (no "object" input schema, an
+// unmarshalable output schema, x-mcp-header on a non-primitive property) is caught here, at listing time.
+func checkAddTool(t *mcp.Tool) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("the MCP server refuses this tool: %v", r)
+		}
+	}()
+	tt := *t
+	if tt.InputSchema == nil {
+		tt.InputSchema = json.RawMessage(`{"type":"object"}`) // what convertTool substitutes
+	}
+	s := mcp.NewServer(&mcp.Implementation{Name: "gpt-home-check", Version: "0"}, nil)
+	s.AddTool(&tt, func(context.Context, *mcp.CallToolRequest) (*mcp.CallToolResult, error) { return nil, nil })
+	return nil
 }
 
 var langRe = regexp.MustCompile(`^[a-z]{2,3}(-[A-Za-z0-9]{2,8})*$`)

@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"hash/fnv"
@@ -59,9 +60,16 @@ func (g *gateway) current() *snapshot {
 	changed := g.host.Changed() // before Tools, so a change in between is not missed
 	var tools []hub.Tool
 	for _, t := range g.host.Tools(hub.AudienceAssistant) {
-		if t, ok := usable(t); ok {
-			tools = append(tools, t)
+		t, ok := usable(t)
+		if !ok {
+			continue
 		}
+		if err := checkAddTool(t); err != nil {
+			// One bad schema must not take /mcp and the REST façade down for everyone who may use the plugin.
+			g.opts.Log.Warn("skipping tool the MCP server refuses", "tool", t.Name, "plugin", t.PluginID, "err", err)
+			continue
+		}
+		tools = append(tools, t)
 	}
 	g.snap = &snapshot{changed: changed, tools: tools, instructions: g.instructions(), views: map[string]*view{}}
 	return g.snap
@@ -101,6 +109,19 @@ func usable(t hub.Tool) (hub.Tool, bool) {
 		t.Annotations = nil
 	}
 	return t, true
+}
+
+// checkAddTool registers t on a throwaway MCP server and turns the go-sdk's AddTool panic (a schema it refuses, e.g.
+// x-mcp-header on a non-primitive property) into an error, so buildView never panics on the request path.
+func checkAddTool(t hub.Tool) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("%v", r)
+		}
+	}()
+	s := mcp.NewServer(&mcp.Implementation{Name: "gpt-home-check", Version: "0"}, nil)
+	s.AddTool(mcpTool(t), func(context.Context, *mcp.CallToolRequest) (*mcp.CallToolResult, error) { return nil, nil })
+	return nil
 }
 
 // present returns nil for an empty or JSON-null raw value, the value otherwise.

@@ -18,7 +18,8 @@ Daemon:
   homed run [--listen 127.0.0.1:8080]          serve the gateway, the plugins, the relay and the local socket
 
 Relay:
-  homed relay connect <code | ->               store a connect code ("-" reads it from stdin)
+  homed relay connect <- | code>               store a connect code; "-" reads it from stdin and keeps it
+                                               out of shell history and the process list
   homed relay status                           connection and self-check of the running homed
 
 Person keys (stored in homed.yaml as hashes; a running homed picks up changes at once):

@@ -7,6 +7,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"net/http"
 	"strings"
 	"sync"
@@ -32,6 +33,8 @@ type Options struct {
 	Version string
 	// RateLimit is the number of tool calls per minute allowed per key (token bucket). Zero or less means 120.
 	RateLimit int
+	// Log receives warnings about tools the gateway has to skip. Nil discards them.
+	Log *slog.Logger
 }
 
 const (
@@ -70,6 +73,9 @@ func New(host hub.ToolHost, keyResolver hub.KeyResolver, audit hub.Auditor, opts
 	}
 	if opts.Version == "" {
 		opts.Version = "dev"
+	}
+	if opts.Log == nil {
+		opts.Log = slog.New(slog.DiscardHandler)
 	}
 	g := &gateway{
 		host:    host,

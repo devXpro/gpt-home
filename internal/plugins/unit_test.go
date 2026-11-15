@@ -80,6 +80,15 @@ func TestConvertTool(t *testing.T) {
 	}{
 		{name: "plain", tool: &mcp.Tool{Name: "tv_on"}, audience: hub.AudienceAssistant, timeout: 30 * time.Second},
 		{name: "bad name", tool: &mcp.Tool{Name: "kettle_on"}, skip: true},
+		// Schemas the go-sdk's AddTool panics on: skipped here, so the gateway never sees them.
+		{name: "input schema not an object", tool: &mcp.Tool{Name: "tv_on", InputSchema: map[string]any{"type": "string"}}, skip: true},
+		{name: "x-mcp-header on an object", tool: &mcp.Tool{Name: "tv_on", InputSchema: map[string]any{
+			"type": "object", "properties": map[string]any{"o": map[string]any{"type": "object", "x-mcp-header": "X-O"}},
+		}}, skip: true},
+		{name: "x-mcp-header not a header name", tool: &mcp.Tool{Name: "tv_on", InputSchema: map[string]any{
+			"type": "object", "properties": map[string]any{"o": map[string]any{"type": "string", "x-mcp-header": "a b"}},
+		}}, skip: true},
+		{name: "output schema not marshalable", tool: &mcp.Tool{Name: "tv_on", OutputSchema: func() {}}, skip: true},
 		{name: "admin", tool: pluginkit.Admin(&mcp.Tool{Name: "tv_pair"}), audience: hub.AudienceAdmin, timeout: 30 * time.Second},
 		{name: "explicit assistant", tool: &mcp.Tool{Name: "tv_on", Meta: mcp.Meta{pluginkit.MetaAudience: "assistant"}},
 			audience: hub.AudienceAssistant, timeout: 30 * time.Second},

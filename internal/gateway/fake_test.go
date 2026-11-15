@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -13,6 +14,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/modelcontextprotocol/go-sdk/jsonrpc"
 
 	"github.com/devXpro/gpt-home/internal/hub"
 	"github.com/devXpro/gpt-home/internal/keys"
@@ -87,6 +90,15 @@ func (f *fakeHost) Call(ctx context.Context, caller hub.Caller, name string, arg
 		return hub.Result{}, ctx.Err()
 	case "boom":
 		return hub.Result{}, errors.New("broken pipe")
+	case "invalid": // what a go-sdk typed handler returns for arguments its schema rejects
+		return hub.Result{
+			Text:    `validating "arguments": validating root: validating /properties/pin: pattern: "secret-4321" does not match`,
+			IsError: true,
+		}, nil
+	case "rpcinvalid":
+		return hub.Result{}, fmt.Errorf("%s: %w", name, &jsonrpc.Error{
+			Code: jsonrpc.CodeInvalidParams, Message: `bad pin "secret-4321"`,
+		})
 	}
 	if name == "tv_status" {
 		return hub.Result{Text: "Living room TV is on.", Structured: json.RawMessage(`{"on":true,"input":"HDMI 1"}`)}, nil

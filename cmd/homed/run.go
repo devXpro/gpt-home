@@ -84,6 +84,15 @@ func serve(ctx context.Context, opts runOptions, log *slog.Logger) error {
 	if err != nil {
 		return err
 	}
+	// The instance lock comes first and is held until serve returns: one homed per data dir.
+	unlock, err := config.LockInstance(dir)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	if w := config.DataDirWarning(dir); w != "" {
+		log.Warn(w)
+	}
 	cfg, err := config.Load(dir)
 	if err != nil {
 		return err
@@ -113,7 +122,6 @@ func serve(ctx context.Context, opts runOptions, log *slog.Logger) error {
 		}
 	}
 
-	// The socket comes first: it also refuses a second homed on the same data dir.
 	sockLn, err := listenSocket(ctx, filepath.Join(dir, config.SocketFile))
 	if err != nil {
 		return err
@@ -154,6 +162,7 @@ func serve(ctx context.Context, opts runOptions, log *slog.Logger) error {
 		Instructions: d.host.Instructions,
 		InstanceID:   id,
 		Version:      version,
+		Log:          log.With("component", "gateway"),
 	})
 	httpSrv := &http.Server{Handler: hostGuard(cfg.Relay.Domain, port, gw), ReadHeaderTimeout: 10 * time.Second}
 	sockSrv := &http.Server{Handler: d.socketHandler(), ReadHeaderTimeout: 10 * time.Second}
@@ -169,7 +178,7 @@ func serve(ctx context.Context, opts runOptions, log *slog.Logger) error {
 	runCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	if cfg.Relay.Domain == "" {
-		log.Warn("relay not configured; serving locally only (run: homed relay connect <code>)")
+		log.Warn("relay not configured; serving locally only (run: homed relay connect - and paste the code)")
 	} else {
 		d.relay = &relay.Client{}
 		d.relayCfg = relay.Config{
@@ -288,7 +297,8 @@ func (d *daemon) selfCheckLoop(ctx context.Context) {
 	}
 }
 
-// listenSocket listens on the unix socket path (0600). A live socket means another homed runs on this data dir.
+// listenSocket listens on the unix socket path (0600). The caller holds the instance lock, so a socket file left
+// there belongs to a homed that is gone and is replaced; one that still answers is refused, never removed.
 func listenSocket(ctx context.Context, path string) (net.Listener, error) {
 	// sun_path holds 104 bytes on macOS (108 on Linux), the terminating NUL included.
 	if len(path) > 103 {
@@ -297,7 +307,7 @@ func listenSocket(ctx context.Context, path string) (net.Listener, error) {
 	var dialer net.Dialer
 	if c, err := dialer.DialContext(ctx, "unix", path); err == nil {
 		_ = c.Close()
-		return nil, fmt.Errorf("homed is already running on this data dir (socket %s)", path)
+		return nil, fmt.Errorf("something already answers on the socket %s", path)
 	}
 	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return nil, err

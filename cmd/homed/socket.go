@@ -25,6 +25,7 @@ import (
 
 	"github.com/devXpro/gpt-home/internal/audit"
 	"github.com/devXpro/gpt-home/internal/config"
+	"github.com/devXpro/gpt-home/internal/gateway"
 	"github.com/devXpro/gpt-home/internal/hub"
 )
 
@@ -154,13 +155,7 @@ func (d *daemon) socketCall(w http.ResponseWriter, r *http.Request) {
 	res, err := d.host.Call(r.Context(), cliCaller, name, args)
 	entry := hub.AuditEntry{
 		At: start, Caller: cliCaller, Tool: name, Args: audit.Redact(args),
-		OK: err == nil && !res.IsError, Duration: time.Since(start),
-	}
-	switch {
-	case err != nil:
-		entry.Error = err.Error()
-	case res.IsError:
-		entry.Error = res.Text
+		OK: err == nil && !res.IsError, Error: gateway.AuditError(res, err), Duration: time.Since(start),
 	}
 	d.audit.Record(r.Context(), entry)
 
