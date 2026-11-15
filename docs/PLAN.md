@@ -81,8 +81,10 @@ home box (Mac now, Raspberry Pi later): homed, 127.0.0.1:8080
 **Home offline.** No frpc is connected, so frps answers with its `custom404Page`: an HTML "home is offline" page with
 status 404. The Site recognizes a non-JSON 404 and tells the user the home is offline.
 
-**Trust.** The server terminates TLS, so it sees request contents. It cannot forge passkey assertions, though, so it
-cannot perform admin actions. Plugins are not reachable from the network, only through the hub.
+**Trust.** The server terminates TLS, so it sees request contents. It cannot forge passkey assertions, so on its own
+it cannot start a step-up action. It is still trusted like the domain itself: a compromised server could steal a
+fresh setup link or a live session, or serve tampered admin pages while the admin is using them (docs/SECURITY.md).
+Plugins are not reachable from the network, only through the hub.
 
 ## 4. Repositories and layout
 
@@ -405,7 +407,7 @@ device is offline.
   ```
 
 **Connect code.** `ghr1.` + base64url (no padding) of `{"v":1,"domain":"<domain>","token":"<64 hex chars>"}`.
-`install/server.sh` prints it once; `homed relay connect <code>` consumes it.
+`install/server.sh` prints it once; `homed relay connect -` consumes it from stdin (never argv).
 
 **Home client** (embedded `github.com/fatedier/frp/client` v0.72.0 if viable, else a supervised `frpc` binary)
 - `serverAddr = <domain>`, `serverPort = 443`, `transport.protocol = "wss"`.
