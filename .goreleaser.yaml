@@ -1,0 +1,163 @@
+# GoReleaser v2 (tested with v2.20). Run by .github/workflows/release.yml on a `v*` tag; docs/progress/T4.2.md has the
+# asset names, and a local dry run is `goreleaser release --snapshot --clean` (nothing is published in snapshot mode).
+#
+# Asset contract (PLAN §5.1, read by internal/install): homed_<version>_<os>_<arch>.tar.gz with <version> WITHOUT the
+# "v", 32-bit ARM spelled armv7, the binary `homed` at the archive root, and checksums.txt ("<sha256>  <name>").
+version: 2
+
+project_name: gpt-home
+
+before:
+  hooks:
+    # homed embeds the admin SPA (internal/web/dist), so it is built before `go build` (npm ci + vite build).
+    - make web
+
+builds:
+  - id: homed
+    main: ./cmd/homed
+    binary: homed
+    env:
+      - CGO_ENABLED=0
+    flags:
+      - -trimpath
+    goos:
+      - darwin
+      - linux
+    goarch:
+      - amd64
+      - arm64
+      - arm
+    goarm:
+      - "7"
+    ignore:
+      - goos: darwin
+        goarch: arm
+    # cmd/homed/main.go: `var version, commit` -> `homed version` prints "homed <version>".
+    ldflags:
+      - -s -w -X main.version={{ .Version }} -X main.commit={{ .ShortCommit }}
+    mod_timestamp: "{{ .CommitTimestamp }}"
+
+archives:
+  - id: homed
+    ids:
+      - homed
+    formats:
+      - tar.gz
+    # homed_0.1.0_darwin_arm64.tar.gz, homed_0.1.0_linux_amd64.tar.gz, homed_0.1.0_linux_armv7.tar.gz
+    name_template: "homed_{{ .Version }}_{{ .Os }}_{{ .Arch }}{{ with .Arm }}v{{ . }}{{ end }}"
+    files:
+      - LICENSE
+      - README.md
+
+checksum:
+  name_template: checksums.txt
+  algorithm: sha256
+  extra_files:
+    # The ChatGPT Site bundle is built by the workflow (site/: npm ci, check, build, pack dist) into bin/ (gitignored).
+    - glob: ./bin/gpt-home-site.tar.gz
+      name_template: "gpt-home-site_{{ .Version }}.tar.gz"
+
+snapshot:
+  version_template: "{{ incpatch .Version }}-SNAPSHOT-{{ .ShortCommit }}"
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - "^docs?:"
+      - "^test:"
+      - "^ci:"
+      - "^chore:"
+      - "Merge (pull request|branch)"
+
+release:
+  github:
+    owner: devXpro
+    name: gpt-home
+  # v0.2.0-rc1 and the like become GitHub pre-releases (and are skipped for the formula and the `latest` image tag).
+  prerelease: auto
+  extra_files:
+    - glob: ./bin/gpt-home-site.tar.gz
+      name_template: "gpt-home-site_{{ .Version }}.tar.gz"
+  footer: |
+    ## Install
+
+    ```sh
+    # macOS (Homebrew)
+    brew tap devxpro/gpt-home https://github.com/devXpro/gpt-home
+    brew install gpt-home
+    brew services start gpt-home
+
+    # Docker (NAS, Linux): host networking, see the README
+    docker pull ghcr.io/devxpro/gpt-home:{{ .Version }}
+    ```
+
+    Raspberry Pi / Linux: `install/home.sh`. Checksums: `checksums.txt`.
+
+# The formula lives in this repository under Formula/ and is committed with the workflow's GITHUB_TOKEN
+# (contents: write): no personal access token and no separate tap repository.
+# `brews` is deprecated since v2.10 in favour of homebrew_casks, but a cask cannot carry a `service` block, so
+# `brew services` (the LaunchAgent) needs the formula. Revisit when GoReleaser v3 drops it.
+brews:
+  - name: gpt-home
+    ids:
+      - homed
+    goarm: "7"
+    repository:
+      owner: devXpro
+      name: gpt-home
+      branch: main
+      token: "{{ .Env.GITHUB_TOKEN }}"
+    directory: Formula
+    homepage: https://github.com/devXpro/gpt-home
+    description: "LLM-first home hub: ChatGPT controls your devices through a self-hosted relay"
+    license: MIT
+    skip_upload: auto
+    commit_author:
+      name: github-actions[bot]
+      email: 41898282+github-actions[bot]@users.noreply.github.com
+    commit_msg_template: "Brew formula update for {{ .ProjectName }} version {{ .Tag }}"
+    install: |
+      bin.install "homed"
+    # Same shape as the LaunchAgent in docs/DEV.md: start at login, keep alive (a hub self-update exits with 75 on
+    # purpose and is restarted), 10 s between restarts, one log file.
+    service: |
+      run [opt_bin/"homed", "run"]
+      keep_alive true
+      restart_delay 10
+      log_path var/"log/gpt-home/homed.log"
+      error_log_path var/"log/gpt-home/homed.log"
+    caveats: |
+      Start the hub at login:
+        brew services start gpt-home
+      Then open the setup link it prints:
+        homed admin setup-link
+      Logs: #{var}/log/gpt-home/homed.log
+    test: |
+      assert_match "homed", shell_output("#{bin}/homed version")
+
+# linux/amd64, linux/arm64 and linux/arm/v7 images from the binaries built above. The build context holds
+# <os>/<arch>[/<variant>]/homed next to the Dockerfile, see docs/progress/T4.2.md for the Dockerfile contract.
+dockers_v2:
+  - id: homed
+    ids:
+      - homed
+    dockerfile: Dockerfile
+    images:
+      - ghcr.io/devxpro/gpt-home
+    tags:
+      - "{{ .Version }}"
+      - "{{ if not .Prerelease }}latest{{ end }}"
+    platforms:
+      - linux/amd64
+      - linux/arm64
+      - linux/arm/v7
+    labels:
+      org.opencontainers.image.title: gpt-home
+      org.opencontainers.image.description: "GPT-Home hub (homed)"
+      org.opencontainers.image.source: https://github.com/devXpro/gpt-home
+      org.opencontainers.image.version: "{{ .Version }}"
+      org.opencontainers.image.revision: "{{ .FullCommit }}"
+      org.opencontainers.image.licenses: MIT
+    extra_files:
+      - LICENSE
