@@ -28,6 +28,16 @@ type Tool struct {
 	Audience     Audience
 	Inventory    bool          // _meta "gpt-home/role": "inventory"
 	Timeout      time.Duration // from _meta "gpt-home/timeout", default 30s, max 300s
+	// I18n holds translated texts from _meta "gpt-home/i18n", keyed by language ("ru"). Only the admin UI uses it;
+	// assistants always get the English Title and Description. Optional.
+	I18n map[string]ToolText
+}
+
+// ToolText is a tool's title, description and input labels in one language.
+type ToolText struct {
+	Title       string
+	Description string
+	Properties  map[string]string // input property name → label
 }
 
 // Result is the outcome of a tool that ran.

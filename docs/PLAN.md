@@ -157,6 +157,14 @@ gpt-tv/                        module github.com/devXpro/gpt-tv  (GitHub repo ex
   - `"gpt-home/role": "inventory"` — on at most one read-only tool. It returns
     `{"items":[{"id","name","subtitle"?,"state"?}]}`, where `state` is one of
     `on|off|offline|unknown|paired|unpaired`. The admin renders it as the device list.
+  - `"gpt-home/i18n": {"ru": {"title", "description", "properties": {"<input property>": "<label>"}}}` —
+    translated texts for the admin UI (→ `hub.Tool.I18n`). Assistants always get the English texts. Added
+    2026-11-15 by the orchestrator.
+- An input property schema may carry `"x-gpt-home-ref": "inventory"`. It means the value is a device id from this
+  plugin's inventory tool, and the admin renders a device picker for it.
+- **Progress.** Long-running tools (pairing) may send MCP progress notifications for the hub's `progressToken`, with
+  an English `message` and an optional notification `_meta` `"gpt-home/i18n": {"ru": "<message>"}`. The hub forwards
+  them to the admin UI (T2.7, ADMIN-API §8).
 
 **Calls**
 - The hub adds request `_meta` `{"gpt-home/caller":"<person name>","gpt-home/via":"site|mcp|admin|cli"}`. Plugins may
@@ -525,7 +533,7 @@ people:
 | 4 | T0.5 (O + Roman) after T0.2+T0.3+T0.4 · T1.5 after T0.5 | — |
 | 5 | T1.6 (O + Roman) · T1.R | T1.3, T1.4, T1.5 |
 | 6 | T2.0 | phase 1 gate |
-| 7 | T2.1, T2.2, T2.3, T2.4, T2.5 | T2.0 |
+| 7 | T2.1, T2.2, T2.3, T2.4, T2.5, T2.7 (started 2026-11-15 in parallel with T1.3) | T2.0 |
 | 8 | T2.6 → T2.R | wave 7 |
 | 9 | T3.0 (O) → T3.1 + (T3.2 or T3.3) + T3.4 → T3.5 (O + Roman + Tanya) → T3.R | phase 2 gate |
 | 10 | T4.1, T4.2, T4.3, T4.4 → T4.5 (O) | phase 3 gate |
@@ -552,6 +560,7 @@ people:
 | T2.3 admin API backend | Opus | high | broad |
 | T2.4 admin UI | Opus | max | the face of the product |
 | T2.5 plugin installer + self-update | Sonnet | high | standard, needs care |
+| T2.7 progress + plugin i18n | Opus | high | protocol across hub, pluginkit and gpt-tv |
 | T2.6 integration + e2e | Opus | high | integration |
 | T2.R security review | Opus | max | security |
 | T3.1 people + invites | Opus | high | auth flows |
@@ -1009,6 +1018,28 @@ JSON Schema before calling and stream progress over SSE. Tests run with httptest
 - Atomic switch, with a rollback if the new version fails to start.
 - `homed` self-update: download, verify, replace, then exit and let the service manager restart it.
 - Tests run against an httptest fake of the GitHub API.
+
+#### T2.7 — Progress plumbing and plugin i18n  · Opus / high
+**Owns:** `internal/plugins/**`, `pluginkit/**`, `docs/PLUGINS.md`, and in gpt-tv `internal/tools/**` (+ its tests).
+
+**Do**
+1. `internal/plugins`:
+   - parse `_meta "gpt-home/i18n"` into `hub.Tool.I18n` (lenient: skip malformed entries with a warning);
+   - progress through the context, without changing `hub.ToolHost`: `plugins.WithProgress(ctx, func(Progress))`. If
+     the callback is present, `Call` sends a `progressToken` and forwards every progress notification (progress,
+     total, message, i18n) to it. See ADMIN-API §8.
+2. `pluginkit`:
+   - `I18n(t *mcp.Tool, lang string, text Text) *mcp.Tool` with its own exported `Text` type. Plugins outside this
+     module cannot import `internal/hub`.
+   - `Progress(ctx, req, progress, total float64, message string, i18n map[string]string) error`.
+   - A helper to set `x-gpt-home-ref: "inventory"` on a property schema.
+3. `docs/PLUGINS.md`: document i18n, progress and `x-gpt-home-ref`.
+4. gpt-tv `internal/tools`:
+   - Russian texts for all 10 tools and their input labels;
+   - `x-gpt-home-ref: "inventory"` on every `tv` argument;
+   - `tv_pair` sends progress "Press OK on the TV remote" / «Нажмите OK на пульте телевизора»;
+   - `tv_discover` sends progress while it searches.
+5. Tests for all of the above. gpt-tv tests must still pass with the `replace ../gpt-home`.
 
 #### T2.6 — Integration and e2e  · Opus / high
 Wire the store (and the config import), auth, admin, web and installer into `homed run`. Playwright e2e runs against
