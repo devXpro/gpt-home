@@ -482,7 +482,10 @@ people:
     create; Site publish; passkey add or remove; relay change.
 - Plugins never get the caller's keys. They are not network-reachable; the hub speaks to them over stdio only.
 - The first passkey can only be created through a one-time link from the home box: shown on the LAN setup page
-  behind a PIN printed to the terminal, or by `homed admin setup-link`. It is valid for 15 min.
+  behind a PIN, or by `homed admin setup-link` (valid 15 min). Since T2.F the LAN page lives 30 min (reopen with
+  `homed admin firstrun`), listens on 0.0.0.0 only while no relay is configured (else 127.0.0.1), uses an 8-digit
+  PIN that rotates every 10 min and after each link, caps failures per device (5) and in total (20), prints the PIN
+  only to a terminal (never a log), and its links live 3 min.
 
 ## 6. Rules for every agent
 
@@ -968,7 +971,7 @@ people, keys and plugins from `homed.yaml`. Tests run on temp DBs.
    - add and remove a passkey; the last passkey cannot be removed.
 3. Sessions per §5.8; rate limits on the auth endpoints; admin audit events.
 4. First run:
-   - a LAN page on `setup_listen` (default `0.0.0.0:8090`) protected by a 6-digit PIN printed to the terminal;
+   - a LAN page on `setup_listen` protected by a PIN (hardened in T2.F: see §5.8);
    - steps: enter the connect code → wait for "relay connected" → show the one-time link to `https://<domain>/admin/setup#<token>`.
    - The page serves nothing once an owner exists.
 5. CLI: `homed admin setup-link`, `homed admin reset-access` (local only; it revokes all sessions and passkeys and
@@ -1161,7 +1164,8 @@ These are never delegated:
 
 **Mac (home box for now)**
 - MacBook Pro, M4 Pro, macOS 27, Touch ID.
-- Go 1.25.9 installed (go1.26.11 toolchain auto-fetched for the 1.26 modules), golangci-lint 2.12.2 rebuilt with
+- Go 1.25.9 installed; both go.mod files pin `toolchain go1.26.11` (T2.F — without it the go command picked exactly
+  go1.26.0, which has reachable stdlib CVEs; `make vuln` runs govulncheck); golangci-lint 2.12.2 rebuilt with
   go1.26.11 in `~/go/bin`, Node 25.3, Docker 29.9 (running), codex-cli 0.163.0, gh logged in as `devXpro`.
 - Claude runs under Paseo.app, which now has Local Network permission. Before it did, LAN traffic failed instantly and
   only `dns-sd` worked.
