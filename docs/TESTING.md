@@ -207,3 +207,27 @@ About 2 s.
 ```sh
 go test -race ./internal/admin/...
 ```
+
+### Passkeys, sessions and the first-run page (`internal/auth`, `internal/firstrun`)
+
+Runs real WebAuthn ceremonies (go-webauthn) against a virtual authenticator (`github.com/descope/virtualwebauthn`,
+EC2 passkeys, synced and hardware-key flags) on an in-memory store (`internal/auth/authtest`) and a fake clock; no
+network, no Docker, no browser. `internal/auth`: setup link → registration → Me and the `__Host-gh_session` cookie →
+discoverable sign-in → logout; an imported owner, a family invite, renames and the home name; registration and sign-in
+rejected for a wrong origin (incl. http), a wrong or parent RP ID, missing user verification or presence, bad backup
+flags, unknown passkeys and user handles; replayed and expired ceremonies, an answer to another challenge, a ceremony
+finished at the wrong endpoint; setup tokens single use (also two registrations racing), expired (also between begin
+and finish, with rollback), revoked by a newer link, unknown; step-up (5-minute window, renewal, another person's
+passkey, another session's ceremony), add passkey behind step-up (`excludeCredentials`, `passkey_exists`), clone
+detection by the sign counter, idle and absolute session expiry, touch throttling and event streams, the hourly sweep,
+the CSRF rule, request format errors, the rate limits (per client from the Caddy hop of `X-Forwarded-For`, in total,
+`Retry-After`), `homed admin setup-link` and `reset-access` over the local handler, and the name, slug, device-label
+and credential-storage helpers. `internal/firstrun`: the PIN gate (cookie only hashed, 30 minutes), five wrong PINs →
+a new PIN printed and the lock with `Retry-After`, the relay code step (bad codes, no token in errors, `Connect`),
+`relay_not_ready` until connected with a passing self-check, link → passkey registration end to end → every path
+`410 setup_done`, the Host guard against DNS rebinding, CSRF, routes, the SSE `relay` stream, and `Serve` printing
+the URL and PIN. About 3 s.
+
+```sh
+go test -race ./internal/auth/... ./internal/firstrun/...
+```
