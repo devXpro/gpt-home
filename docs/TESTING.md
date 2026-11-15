@@ -157,3 +157,17 @@ unix socket path must fit in 103 bytes. About 2 s; no network, no Docker.
 ```sh
 go test -race ./cmd/homed/... ./internal/config/...
 ```
+
+### SQLite store (`internal/store`)
+
+Covers the T2.1 implementation of the `store.Store` contract on throw-away databases in `t.TempDir()` with a fake clock:
+file mode 0600 (also `-wal` and `-shm`), WAL, foreign keys and busy timeout, embedded migrations (run once, newer schema
+refused), every repository (people, passkeys, sessions, person keys, invites, connections, plugins, audit, settings) with
+its errors (`ErrNotFound`, `ErrConflict`, `ErrLastPasskey`, `ErrTokenExpired`, `ErrTokenUsed`), cascade delete of a
+person, audit filters, cursor paging, limit caps and prune, `InTx` (commit, rollback, nesting, the first-run flow), the
+races that must have one winner (the last two passkeys, one setup token), concurrent writers, and `ImportPhase1`
+(owner first, once per database, merge into an existing home, bad input changes nothing). No network, no Docker.
+
+```sh
+go test -race ./internal/store/...
+```
